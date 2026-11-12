@@ -33,6 +33,7 @@ const TEST_TYPES: ReadonlyMap<number, string> = new Map([
 
 export const MAX_CONTENT_CHARS = 10_000;
 export const TRUNCATION_MARKER = '… [truncated]';
+export const OMITTED_EMBED_MARKER = '[Text after an unclosed embedded element was omitted.]';
 
 /** Elements whose content is never text for the reader. */
 const SKIPPED_TAGS = new Set([
@@ -44,6 +45,8 @@ const SKIPPED_TAGS = new Set([
   'svg',
   'object',
 ]);
+/** Embedded elements: an implicit close means the text after them was swallowed. */
+const EMBED_TAGS = new Set(['iframe', 'object']);
 /** Elements that end a paragraph (blank line). */
 const PARAGRAPH_TAGS = new Set(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre']);
 /** Elements that end a line. */
@@ -73,8 +76,11 @@ const CONTROL_CHARS =
  * Converts assignment HTML to readable plain text without a DOM: nothing is
  * executed, loaded or followed. Block elements become line boundaries, list
  * items get "- ", entities are decoded, scripts/styles/embedded content,
- * comments, link targets and images disappear. The result is limited to
- * `maxChars` characters plus TRUNCATION_MARKER.
+ * comments, link targets and images disappear. Tags follow normal HTML
+ * parsing, so a malformed `<iframe/>` or `<object/>` hides everything up to its
+ * closing tag or the end; OMITTED_EMBED_MARKER then says text was omitted. The
+ * text is limited to `maxChars` characters plus TRUNCATION_MARKER, followed by
+ * the omission marker when there is one.
  */
 export function htmlToText(html: string, maxChars = MAX_CONTENT_CHARS): string {
   let output = '';
@@ -82,6 +88,7 @@ export function htmlToText(html: string, maxChars = MAX_CONTENT_CHARS): string {
   // 0: nothing pending, 1: line break, 2: paragraph break before the next text.
   let pendingBreak = 0;
   let pendingBullet = false;
+  let incompleteEmbed = false;
 
   const breakBefore = (level: number) => {
     pendingBreak = Math.max(pendingBreak, level);
@@ -98,7 +105,8 @@ export function htmlToText(html: string, maxChars = MAX_CONTENT_CHARS): string {
         else if (CELL_TAGS.has(name)) output += ' ';
         if (name === 'li') pendingBullet = true;
       },
-      onclosetag(name) {
+      onclosetag(name, isImplied) {
+        if (isImplied && EMBED_TAGS.has(name)) incompleteEmbed = true;
         if (SKIPPED_TAGS.has(name)) {
           skipDepth = Math.max(0, skipDepth - 1);
           return;
@@ -122,14 +130,14 @@ export function htmlToText(html: string, maxChars = MAX_CONTENT_CHARS): string {
         output += text;
       },
     },
-    // Without recognizeSelfClosing, `<iframe/>` would open a skipped element
-    // and swallow all text after it.
-    { decodeEntities: true, recognizeSelfClosing: true }
+    { decodeEntities: true }
   );
   parser.write(html);
   parser.end();
 
-  return truncate(normalizeLines(output), maxChars);
+  const text = truncate(normalizeLines(output), maxChars);
+  if (!incompleteEmbed) return text;
+  return text === '' ? OMITTED_EMBED_MARKER : `${text}\n\n${OMITTED_EMBED_MARKER}`;
 }
 
 /** Removes control and bidi characters and collapses whitespace runs to one space. */

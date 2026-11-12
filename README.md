@@ -231,7 +231,9 @@ Fri Nov 20 2026 10:00 - 10:50: Mathematics (Huiswerk) [CANCELLED]
 cancelled items stay in the list. HTML in the assignment is turned into plain
 text (paragraphs, line breaks and list items are kept); scripts, styles,
 embedded content, link targets and images are dropped, and very long texts are
-cut at 10,000 characters with `… [truncated]`.
+cut at 10,000 characters with `… [truncated]`. Markup is parsed as a browser
+would, so an embedded element that is never closed hides the text after it; the
+text then ends with `[Text after an unclosed embedded element was omitted.]`.
 
 ### `get_tests`
 

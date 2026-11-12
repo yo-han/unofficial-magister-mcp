@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import {
   htmlToText,
   MAX_CONTENT_CHARS,
+  OMITTED_EMBED_MARKER,
   toHomework,
   toTests,
   TRUNCATION_MARKER,
@@ -243,9 +244,37 @@ describe('htmlToText', () => {
   }
 
   for (const tag of ['iframe', 'object']) {
-    it(`keeps text after a self-closing <${tag}/>`, () => {
+    it(`marks text hidden by a malformed self-closing <${tag}/>`, () => {
       const attr = tag === 'iframe' ? 'src' : 'data';
-      assert.equal(htmlToText(`a<${tag} ${attr}="https://unused.invalid"/>Opgave 5`), 'aOpgave 5');
+      assert.equal(
+        htmlToText(`a<${tag} ${attr}="https://unused.invalid"/>Opgave 5`),
+        `a\n\n${OMITTED_EMBED_MARKER}`
+      );
+    });
+  }
+
+  it('adds no marker after a properly closed embed', () => {
+    assert.equal(htmlToText('a<object data="x">geheim</object>Opgave 5'), 'aOpgave 5');
+  });
+
+  it('marks nested malformed embeds once', () => {
+    assert.equal(
+      htmlToText('a<object data="x"/>b<iframe src="https://unused.invalid"/>c'),
+      `a\n\n${OMITTED_EMBED_MARKER}`
+    );
+  });
+
+  it('keeps the omission marker after truncation', () => {
+    const long = htmlToText(`${'y'.repeat(MAX_CONTENT_CHARS + 5)}<iframe/>geheim`);
+    assert.equal(
+      long,
+      `${'y'.repeat(MAX_CONTENT_CHARS)}${TRUNCATION_MARKER}\n\n${OMITTED_EMBED_MARKER}`
+    );
+  });
+
+  for (const tag of ['script', 'style', 'noscript', 'template']) {
+    it(`hides a malformed <${tag}/> body until its closing tag, without a marker`, () => {
+      assert.equal(htmlToText(`voor<${tag}/>geheim</${tag}>na`), 'voorna');
     });
   }
 
