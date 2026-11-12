@@ -110,7 +110,7 @@ export function htmlToText(html: string, maxChars = MAX_CONTENT_CHARS): string {
       },
       ontext(data) {
         if (skipDepth > 0) return;
-        const text = data.replace(CONTROL_CHARS, '').replace(/\s+/g, ' ');
+        const text = collapseWhitespace(data);
         if (text.trim() === '') {
           if (pendingBreak === 0) output += text;
           return;
@@ -122,12 +122,24 @@ export function htmlToText(html: string, maxChars = MAX_CONTENT_CHARS): string {
         output += text;
       },
     },
-    { decodeEntities: true }
+    // Without recognizeSelfClosing, `<iframe/>` would open a skipped element
+    // and swallow all text after it.
+    { decodeEntities: true, recognizeSelfClosing: true }
   );
   parser.write(html);
   parser.end();
 
   return truncate(normalizeLines(output), maxChars);
+}
+
+/** Removes control and bidi characters and collapses whitespace runs to one space. */
+function collapseWhitespace(text: string): string {
+  return text.replace(CONTROL_CHARS, '').replace(/\s+/g, ' ');
+}
+
+/** Plain text (never HTML) as one trimmed line, possibly empty. */
+function singleLine(text: string | null | undefined): string {
+  return collapseWhitespace(text ?? '').trim();
 }
 
 /** Trims every line, drops leading/trailing blank lines and keeps at most one blank line. */
@@ -151,8 +163,8 @@ function truncate(text: string, maxChars: number): string {
 }
 
 function subjectOf(appt: Appointment): string {
-  const named = appt.Vakken?.find((vak) => vak.Naam)?.Naam;
-  return named || appt.Omschrijving || 'Unknown';
+  const named = (appt.Vakken ?? []).map((vak) => singleLine(vak.Naam)).find((name) => name);
+  return named || singleLine(appt.Omschrijving) || 'Unknown';
 }
 
 function toAssignment(appt: Appointment, kind: string): AssignmentItem {

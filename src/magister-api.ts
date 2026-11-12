@@ -48,7 +48,6 @@ export const AppointmentSchema = z.object({
   Uitval: z.boolean().nullish(),
   Vervallen: z.boolean().nullish(),
   Inhoud: z.string().nullish(),
-  Id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullish(),
   /** AfspraakInfoType: 1 homework, 2-5 tests, 0/6/7 other. */
   InfoType: z.number().int().nonnegative().nullish(),
   Afgerond: z.boolean().nullish(),

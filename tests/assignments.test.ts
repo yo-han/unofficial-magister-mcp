@@ -16,7 +16,7 @@ import {
 } from '../src/magister-api.js';
 
 /** All text below is synthetic. */
-function appt(overrides: Partial<Appointment> = {}): Appointment {
+function appt(overrides: Partial<Appointment> & { Id?: unknown } = {}): Appointment {
   return AppointmentSchema.parse({
     Start: '2026-11-16T08:30:00.0000000+01:00',
     Einde: '2026-11-16T09:20:00.0000000+01:00',
@@ -81,10 +81,26 @@ describe('assignment classification', () => {
 
   it('prefers the subject name, then the description, then Unknown', () => {
     assert.equal(toHomework([appt()])[0].subject, 'Wiskunde');
+    assert.equal(
+      toHomework([appt({ Vakken: [{ Naam: ' \u200f ' }, { Naam: 'Engels' }] })])[0].subject,
+      'Engels'
+    );
+    assert.equal(toHomework([appt({ Vakken: [{ Naam: ' \n\t ' }] })])[0].subject, 'wis - 1a');
+    assert.equal(
+      toHomework([appt({ Vakken: [{ Naam: '  ' }], Omschrijving: '\u202e\n ' })])[0].subject,
+      'Unknown'
+    );
     assert.equal(toHomework([appt({ Vakken: [] })])[0].subject, 'wis - 1a');
     assert.equal(toHomework([appt({ Vakken: [{ Naam: null }] })])[0].subject, 'wis - 1a');
     assert.equal(toHomework([appt({ Vakken: null, Omschrijving: null })])[0].subject, 'Unknown');
     assert.equal(toHomework([appt({ Vakken: null, Omschrijving: '' })])[0].subject, 'Unknown');
+  });
+
+  it('normalizes a subject to one readable line without interpreting it', () => {
+    const subject = (fields: Partial<Appointment>) => toHomework([appt(fields)])[0].subject;
+    assert.equal(subject({ Vakken: [{ Naam: ' Wis\nkunde\u202e\u0007\t B ' }] }), 'Wis kunde B');
+    assert.equal(subject({ Vakken: null, Omschrijving: 'wis\r\n- 1a\u2066' }), 'wis - 1a');
+    assert.equal(subject({ Vakken: [{ Naam: '<b>Wis</b> &amp;' }] }), '<b>Wis</b> &amp;');
   });
 
   it('reports completed as true, false or null when unknown', () => {
@@ -130,11 +146,6 @@ describe('appointment metadata at the API boundary', () => {
     ['InfoType', -1],
     ['Afgerond', 'true'],
     ['Afgerond', 1],
-    ['Id', -1],
-    ['Id', 0],
-    ['Id', 1.5],
-    ['Id', '11'],
-    ['Id', Number.MAX_SAFE_INTEGER + 2],
   ] as const) {
     it(`rejects ${field}: ${JSON.stringify(value)}`, () => {
       assert.equal(
@@ -147,6 +158,28 @@ describe('appointment metadata at the API boundary', () => {
       );
     });
   }
+
+  it('ignores the unused Id, whatever its value', () => {
+    for (const Id of [0, -1, 1.5, '11', Number.MAX_SAFE_INTEGER + 2, null]) {
+      const parsed = AppointmentSchema.parse({
+        Start: '2026-11-16T08:30:00Z',
+        Einde: '2026-11-16T09:20:00Z',
+        Id,
+        InfoType: 2,
+        Afgerond: true,
+      });
+      assert.equal('Id' in parsed, false);
+      assert.equal(parsed.InfoType, 2);
+      assert.equal(parsed.Afgerond, true);
+    }
+    assert.equal(
+      AppointmentsSchema.parse({
+        Items: [{ Start: '2026-11-16T08:30:00Z', Einde: '2026-11-16T09:20:00Z', Id: 0 }],
+        TotalCount: 1,
+      }).length,
+      1
+    );
+  });
 
   it('still accepts appointments without the new metadata', () => {
     const parsed = AppointmentSchema.parse({
@@ -208,6 +241,26 @@ describe('htmlToText', () => {
       assert.equal(htmlToText(`voor<${tag}>geheim<b>ook</b></${tag}>na`), 'voorna');
     });
   }
+
+  for (const tag of ['iframe', 'object']) {
+    it(`keeps text after a self-closing <${tag}/>`, () => {
+      const attr = tag === 'iframe' ? 'src' : 'data';
+      assert.equal(htmlToText(`a<${tag} ${attr}="https://unused.invalid"/>Opgave 5`), 'aOpgave 5');
+    });
+  }
+
+  it('keeps text after nested skipped tags and an ordinary closed embed', () => {
+    assert.equal(
+      htmlToText('voor<object><iframe src="https://unused.invalid"></iframe>geheim</object>na'),
+      'voorna'
+    );
+    assert.equal(htmlToText('voor<svg><style>x</style><g/>geheim</svg>na'), 'voorna');
+    assert.equal(htmlToText('voor<object data="x"><svg/>geheim</object>na'), 'voorna');
+    assert.equal(
+      htmlToText('a<iframe src="https://unused.invalid"></iframe>Opgave 5'),
+      'aOpgave 5'
+    );
+  });
 
   it('drops comments, link targets and images', () => {
     assert.equal(htmlToText('a<!-- verborgen -->b'), 'ab');

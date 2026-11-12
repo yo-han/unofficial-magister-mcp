@@ -258,7 +258,7 @@ marked as done or submitted.
 2. **Session**: Stored privately per account; restored headless and checked against `/api/account` (a different account is `[SESSION_MISMATCH]`)
 3. **Refresh**: An expired token is renewed silently through the existing Magister session; if that needs a login form, you get `[SESSION_EXPIRED]`
 4. **API access**: Requests go to your exact school origin, never follow redirects, and responses are schema-validated
-5. **Caching**: In memory only, per account and child, 5 minutes fresh, at most 30 minutes stale; the schedule, homework and tests share one cache, so asking for all three over the same days costs one API call
+5. **Caching**: In memory only, per account and child, one entry per day (at most 64 days, least recently used first out), 5 minutes fresh, at most 30 minutes stale; the schedule, homework and tests share one cache, so asking for all three over the same days within those 5 minutes costs one API call (a stale hit is answered from the cache and refreshed with one call in the background)
 
 A Magister error is reported as an error (`[UPSTREAM_UNAVAILABLE]` or
 `[UPSTREAM_INVALID_RESPONSE]`), never as an empty schedule. A response that

@@ -60,7 +60,6 @@ export interface Appointment {
   Lokatie?: string | null;
   Status?: number;
   Inhoud?: string | null;
-  Id?: number;
   InfoType?: number | null;
   Afgerond?: boolean | null;
   [key: string]: unknown;
@@ -160,7 +159,7 @@ export function lesson(
     Lokatie: null,
     Status: 1,
     Inhoud: null,
-    Id: 1 + Math.floor(Math.random() * 1e6),
+    Id: Math.floor(Math.random() * 1e6),
     ...extra,
   };
 }

@@ -68,8 +68,9 @@ function formatCompleted(completed: boolean | null): string {
 }
 
 /**
- * Assignment content is external data: it only ever appears indented below a
- * fixed "Content:" label, never in a header line.
+ * The assignment body is free-form external text: it only ever appears
+ * indented below a fixed "Content:" label, never in the header line. The
+ * header holds the subject, normalized to one line, and fixed labels.
  */
 function formatAssignment(item: AssignmentItem): string {
   const status = item.cancelled ? ' [CANCELLED]' : '';
