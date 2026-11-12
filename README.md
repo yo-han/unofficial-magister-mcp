@@ -81,6 +81,9 @@ tokens at Magister. A running server notices the logout on its next tool call.
 | `MAGISTER_SSO_ORIGINS` | no | Comma-separated exact `https://` origins of your school's SSO provider, if it uses one |
 | `MAGISTER_AUTH_MODE` | no | `interactive` (default) or `password` |
 | `MAGISTER_USER`, `MAGISTER_PASS` | password mode only | Credentials for unattended login |
+| `MAGISTER_1PASSWORD_OTP` | no | OTP field path `vault/item/[section/]field`, **without** `op://`; read at each MFA challenge |
+| `MAGISTER_1PASSWORD_ACCOUNT` | no | 1Password account for OTP reads (use with multiple accounts) |
+| `MAGISTER_1PASSWORD_COMMAND` | no | Absolute 1Password CLI path, or `op` on PATH (default) |
 | `MAGISTER_DEBUG` | no | `1` for debug events on stderr |
 
 A `.env` file in the working directory is read at startup (see `.env.example`).
@@ -111,9 +114,53 @@ the same browser window.
 
 `MAGISTER_AUTH_MODE=password` lets the server log in unattended with
 `MAGISTER_USER` and `MAGISTER_PASS`. Credentials are only typed into a form on
-`https://accounts.magister.net`, never on an SSO or other origin. MFA is not
-supported in this mode. Prefer interactive login: it keeps your password out
-of configuration files.
+`https://accounts.magister.net`, never on an SSO or other origin. Expired tokens
+reuse the SSO session when possible, otherwise the server signs in again in a
+headless browser. Accounts offering a passkey can use their password instead.
+
+For Magister authenticator codes stored in 1Password, set `MAGISTER_1PASSWORD_OTP`.
+The server asks the CLI for a fresh code at each challenge, including subsequent
+logins. It never saves the code or OTP seed. Code entry is restricted to the exact
+Magister authentication origin. A missing configuration returns `[MFA_REQUIRED]`;
+an unavailable CLI, locked vault or invalid code format returns `[MFA_UNAVAILABLE]`.
+
+Use `op run` to supply credentials without putting their values in your MCP
+configuration. For example, in Claude Desktop/Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "magister": {
+      "command": "/opt/homebrew/bin/op",
+      "args": ["--account", "example.1password.com", "run", "--", "/absolute/path/to/node", "/absolute/path/to/unofficial-magister-mcp/dist/index.js"],
+      "env": {
+        "MAGISTER_SCHOOL": "schoolname",
+        "MAGISTER_PROFILE": "default",
+        "MAGISTER_AUTH_MODE": "password",
+        "MAGISTER_USER": "op://Private/Magister/username",
+        "MAGISTER_PASS": "op://Private/Magister/password",
+        "MAGISTER_1PASSWORD_OTP": "Private/Magister/Herstel code/one-time password",
+        "MAGISTER_1PASSWORD_ACCOUNT": "example.1password.com",
+        "MAGISTER_1PASSWORD_COMMAND": "/opt/homebrew/bin/op"
+      }
+    }
+  }
+}
+```
+
+Replace the example account, paths and field names with yours. Vault/item IDs
+also work and survive renaming. Keep your existing `MAGISTER_PROFILE` when
+switching from interactive login so the stored account identity stays the same.
+The OTP path deliberately omits `op://`: otherwise `op run` resolves it once at
+startup, instead of fetching a current code when Magister requests it.
+
+Enable the 1Password desktop app's CLI integration. 1Password may still require
+unlocking or authorization; the server does not bypass that protection. Username
+and password are loaded into process memory at startup, so restart the MCP after
+changing them. For Codex, use the same command, arguments and environment under
+`mcp_servers.magister` in its TOML configuration; a 120-second tool timeout allows
+time for login. Interactive login remains available when you prefer to sign in
+yourself.
 
 ## Usage with Claude Code
 
@@ -274,7 +321,7 @@ with `MAGISTER_CHILD_ID`. Names from the children endpoint are not exposed.
 
 ## Not supported
 
-- MFA in password mode
+- Other MFA methods or third-party SSO forms in password mode
 - Revoking tokens at Magister on `logout`
 - Several children in one server (run one server per child with `MAGISTER_CHILD_ID`)
 - Encrypted session storage

@@ -20,6 +20,7 @@ import { Appointment, AppointmentsSchema, isCancelled } from './magister-api.js'
 import { ClassResult, firstClass, lastClass, ScheduleItem } from './schedule.js';
 import type { ScheduleClient } from './server.js';
 import type { AccountStore, StoredSession } from './storage.js';
+import { readOnePasswordOtp } from './one-password.js';
 
 export type { ClientDeps, ClientTimeouts } from './browser-session.js';
 
@@ -27,11 +28,13 @@ export type { ClientDeps, ClientTimeouts } from './browser-session.js';
 const EXPIRY_MARGIN_MS = 60_000;
 
 export function defaultClientDeps(config: Config, store: AccountStore | null): ClientDeps {
+  const otp = config.otp;
   return {
     config,
     store,
     launchBrowser: (headless) => chromium.launch({ headless }),
     timeouts: DEFAULT_TIMEOUTS,
+    ...(otp ? { getOtp: () => readOnePasswordOtp(otp) } : {}),
   };
 }
 

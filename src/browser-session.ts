@@ -25,6 +25,8 @@ export interface ClientDeps {
   /** Hook to install routes before the origin policy (tests use it for the fixture). */
   prepareContext?: (context: BrowserContext) => Promise<void>;
   timeouts: ClientTimeouts;
+  /** Produces a fresh MFA code; tests inject synthetic values. */
+  getOtp?: () => Promise<string>;
 }
 
 export const DEFAULT_TIMEOUTS: ClientTimeouts = {

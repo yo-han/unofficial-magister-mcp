@@ -22,6 +22,7 @@ export interface Config {
   readonly ssoOrigins: readonly string[];
   readonly sessionMaxAgeMs: number;
   readonly debug: boolean;
+  readonly otp?: { reference: string; account?: string; command: string };
 }
 
 export interface ConfigOptions {
@@ -192,6 +193,28 @@ export function loadConfig(
   const profile = env.MAGISTER_PROFILE || env.MAGISTER_USER || 'default';
   if (profile.length > 256) throw new PublicError('CONFIG_INVALID', 'MAGISTER_PROFILE');
 
+  let otp: Config['otp'];
+  if (env.MAGISTER_1PASSWORD_OTP) {
+    // No op:// prefix: `op run` must not resolve this to a stale code at startup.
+    const path = env.MAGISTER_1PASSWORD_OTP;
+    if (
+      authMode !== 'password' ||
+      path !== path.trim() ||
+      !/^[\w .-]+\/[\w .-]+\/(?:[\w .-]+\/)?[\w .-]+$/.test(path)
+    ) {
+      throw new PublicError('CONFIG_INVALID', 'MAGISTER_1PASSWORD_OTP');
+    }
+    const command = env.MAGISTER_1PASSWORD_COMMAND || 'op';
+    if (command !== 'op' && !isAbsolute(command)) {
+      throw new PublicError('CONFIG_INVALID', 'MAGISTER_1PASSWORD_COMMAND');
+    }
+    otp = {
+      reference: `op://${path}?attribute=otp`,
+      command,
+      ...(env.MAGISTER_1PASSWORD_ACCOUNT ? { account: env.MAGISTER_1PASSWORD_ACCOUNT } : {}),
+    };
+  }
+
   let childId: number | undefined;
   if (env.MAGISTER_CHILD_ID) {
     const parsed = parsePositiveInt(env.MAGISTER_CHILD_ID, Number.MAX_SAFE_INTEGER);
@@ -218,5 +241,6 @@ export function loadConfig(
     ssoOrigins: parseSsoOrigins(env.MAGISTER_SSO_ORIGINS),
     sessionMaxAgeMs: sessionMaxAgeDays * DAY_MS,
     debug: env.MAGISTER_DEBUG === '1' || env.MAGISTER_DEBUG === 'true',
+    ...(otp ? { otp } : {}),
   };
 }
