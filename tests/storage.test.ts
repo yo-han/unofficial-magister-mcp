@@ -217,12 +217,33 @@ describe('AccountStore', { skip: !posix && 'POSIX permissions only' }, () => {
     await store.deleteAccount();
     assert.equal(await store.replaceSession(sessionFor(store, { sessionId: 'one' }), 'one'), false);
     assert.equal(existsSync(store.sessionPath), false);
+    // A refused replace must not recreate the account directory either.
+    assert.equal(existsSync(dirname(store.sessionPath)), false);
+  });
+
+  it('does not commit when the session disappears while the new one is being written', async () => {
+    class RacingStore extends AccountStore {
+      reads = 0;
+      override async currentSessionId() {
+        this.reads += 1;
+        // First check (before writing) still sees the session; a logout happens
+        // before the rename-time check.
+        if (this.reads === 1) return 'one';
+        await this.deleteAccount();
+        return null;
+      }
+    }
+    const store = new RacingStore({ stateDir, schoolOrigin: SCHOOL, profile: 'parent' });
+    assert.equal(await store.replaceSession(sessionFor(store, { sessionId: 'one' }), 'one'), false);
+    assert.equal(store.reads, 2);
+    assert.equal(existsSync(store.sessionPath), false);
   });
 
   it('refuses a session file that is too large', async () => {
     const store = new AccountStore({ stateDir, schoolOrigin: SCHOOL, profile: 'parent' });
     await store.writeSession(sessionFor(store));
-    writeFileSync(store.sessionPath, 'x'.repeat(2 * 1024 * 1024));
+    const huge = sessionFor(store, { accessToken: 'x'.repeat(2 * 1024 * 1024) });
+    writeFileSync(store.sessionPath, JSON.stringify(huge));
     assert.equal(await store.readSession(), null);
   });
 
