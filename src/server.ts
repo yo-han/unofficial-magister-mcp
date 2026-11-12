@@ -6,6 +6,7 @@ import {
   ListToolsRequestSchema,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
+import type { AssignmentItem } from './assignments.js';
 import { CalendarDate, formatDisplayDate, weekRange } from './dates.js';
 import { PublicError, toPublicError } from './errors.js';
 import { logEvent } from './logger.js';
@@ -18,6 +19,8 @@ export interface ScheduleClient {
   getWeekSchedule(dates: CalendarDate[]): Promise<Record<CalendarDate, ScheduleItem[]>>;
   getFirstClass(date: CalendarDate): Promise<ClassResult>;
   getLastClass(date: CalendarDate): Promise<ClassResult>;
+  getHomework(dates: CalendarDate[]): Promise<AssignmentItem[]>;
+  getTests(dates: CalendarDate[]): Promise<AssignmentItem[]>;
 }
 
 export interface ServerOptions {
@@ -59,6 +62,42 @@ function formatClassResult(
   return `No classes scheduled for ${display}`;
 }
 
+function formatCompleted(completed: boolean | null): string {
+  if (completed === null) return 'unknown';
+  return completed ? 'yes' : 'no';
+}
+
+/**
+ * Assignment content is external data: it only ever appears indented below a
+ * fixed "Content:" label, never in a header line.
+ */
+function formatAssignment(item: AssignmentItem): string {
+  const status = item.cancelled ? ' [CANCELLED]' : '';
+  const lines = [
+    `${formatDisplayDate(item.date)} ${item.startTime} - ${item.endTime}: ${item.subject} (${item.kind})${status}`,
+    `  Completed: ${formatCompleted(item.completed)}`,
+  ];
+  if (item.content === '') {
+    lines.push('  Content: (no content)');
+  } else {
+    lines.push(
+      '  Content:',
+      ...item.content.split('\n').map((line) => (line === '' ? '' : `    ${line}`))
+    );
+  }
+  return lines.join('\n');
+}
+
+export function formatAssignments(
+  label: 'Homework' | 'Tests',
+  dates: CalendarDate[],
+  items: AssignmentItem[]
+): string {
+  const period = `from ${formatDisplayDate(dates[0])} to ${formatDisplayDate(dates[dates.length - 1])}`;
+  if (items.length === 0) return `No ${label.toLowerCase()} found ${period}.`;
+  return `${label} ${period}:\n\n${items.map(formatAssignment).join('\n\n')}`;
+}
+
 async function runTool(call: ToolCall, client: ScheduleClient, now: Date): Promise<string> {
   switch (call.name) {
     case 'get_schedule': {
@@ -77,6 +116,10 @@ async function runTool(call: ToolCall, client: ScheduleClient, now: Date): Promi
       return formatClassResult(call.date, await client.getFirstClass(call.date), 'first');
     case 'get_pickup_time':
       return formatClassResult(call.date, await client.getLastClass(call.date), 'last');
+    case 'get_homework':
+      return formatAssignments('Homework', call.dates, await client.getHomework(call.dates));
+    case 'get_tests':
+      return formatAssignments('Tests', call.dates, await client.getTests(call.dates));
   }
 }
 

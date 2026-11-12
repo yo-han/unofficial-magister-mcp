@@ -29,8 +29,9 @@ Browser tests need Chromium: `npx playwright install chromium`.
 
 - `src/index.ts` – entry: loads `.env` from the cwd, calls `run()` in `cli.ts`
 - `src/cli.ts` – commands (`login`, `logout`, `--help`, `--version`, none = stdio server) and shutdown on SIGINT/SIGTERM/stdin close
-- `src/server.ts` – MCP server (lowlevel `Server`), the 4 tools, output formatting
-- `src/tools.ts` / `src/dates.ts` – tool definitions, argument validation, Europe/Amsterdam dates
+- `src/server.ts` – MCP server (lowlevel `Server`), the 6 tools, output formatting
+- `src/tools.ts` / `src/dates.ts` – tool definitions, argument validation, Europe/Amsterdam dates and inclusive ranges (default 14, max 31 days)
+- `src/assignments.ts` – homework (InfoType 1) and tests (InfoType 2–5) from agenda appointments; HTML to plain text with htmlparser2 (no DOM, nothing executed or loaded)
 - `src/config.ts` – env validation; canonical school origin; state dir
 - `src/security.ts` / `src/browser-policy.ts` – exact-origin allowlist; context-wide navigation, redirect and popup guard
 - `src/browser-session.ts` – one browser/context/page with the policy applied
@@ -38,7 +39,7 @@ Browser tests need Chromium: `npx playwright install chromium`.
 - `src/magister-api.ts` – API boundary: exact origin, no redirects, zod schemas
 - `src/magister.ts` – `MagisterClient`: restore, refresh, logout detection, schedule mapping
 - `src/storage.ts` – private per-account `session.json` (0700/0600, O_NOFOLLOW, atomic writes)
-- `src/cache.ts` – in-memory schedule cache per client (TTL, max stale, LRU, generation)
+- `src/cache.ts` – in-memory cache of validated appointments per client (TTL, max stale, LRU, generation); schedule, homework and tests are projections of it
 - `src/logger.ts` / `src/errors.ts` – fixed log events on stderr; public errors with fixed codes and texts
 
 ### Rules that must hold
@@ -50,7 +51,7 @@ Browser tests need Chromium: `npx playwright install chromium`.
 - Tests never touch real Magister, real credentials or the real state dir; the fixture in `tests/fixtures/magister-routes.ts` aborts everything else.
 
 ### Key Implementation Details
-- Schedule API endpoint: `/api/personen/{id}/afspraken?status=1&van={date}&tot={date}`; the week is one call
+- Schedule API endpoint: `/api/personen/{id}/afspraken?status=1&van={date}&tot={date}`; a week or homework/test range is one call, with no detail fetches
 - API calls run as `fetch()` inside the page (Playwright's `context.request` bypasses `context.route`)
 
 ## Environment Variables

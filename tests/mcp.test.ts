@@ -25,6 +25,9 @@ describe('compiled server over stdio', { timeout: 60_000 }, () => {
     });
     assert.equal(result.status, 0, result.stdout + result.stderr);
     assert.match(result.stdout, /^ok - without a session get_schedule is NOT_LOGGED_IN$/m);
+    assert.match(result.stdout, /^ok - without a session get_homework is NOT_LOGGED_IN$/m);
+    assert.match(result.stdout, /^ok - without a session get_tests is NOT_LOGGED_IN$/m);
+    assert.match(result.stdout, /^ok - listTools returns exactly the six tools$/m);
     assert.match(result.stdout, /does not prove real Magister authentication/);
   });
 
@@ -65,8 +68,15 @@ describe('compiled server over stdio', { timeout: 60_000 }, () => {
         method: 'tools/call',
         params: { name: 'get_schedule', arguments: { date: 'today' } },
       });
+      send({
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'tools/call',
+        params: { name: 'get_homework', arguments: {} },
+      });
       const deadline = Date.now() + 15_000;
-      while (!stdout.includes('"id":3') && Date.now() < deadline) {
+      // The two tool calls may finish in either order.
+      while (!(stdout.includes('"id":3') && stdout.includes('"id":4')) && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
       const exited = new Promise((resolve) => child.once('exit', resolve));
@@ -74,9 +84,12 @@ describe('compiled server over stdio', { timeout: 60_000 }, () => {
       await exited;
 
       const lines = stdout.split('\n').filter((line) => line.length > 0);
-      assert.equal(lines.length, 3, stdout);
+      assert.equal(lines.length, 4, stdout);
       for (const line of lines) assert.equal(JSON.parse(line).jsonrpc, '2.0');
-      assert.match(lines[2], /NOT_LOGGED_IN/);
+      const byId = new Map(lines.map((line) => [JSON.parse(line).id, line]));
+      assert.deepEqual([...byId.keys()].sort(), [1, 2, 3, 4]);
+      assert.match(byId.get(3) ?? '', /NOT_LOGGED_IN/);
+      assert.match(byId.get(4) ?? '', /NOT_LOGGED_IN/);
       assert.equal(stdout.includes(SENTINEL) || stderr.includes(SENTINEL), false);
       // Closing stdin shuts the server down cleanly.
       assert.match(stderr, /"event":"shutdown","reason":"stdin"/);

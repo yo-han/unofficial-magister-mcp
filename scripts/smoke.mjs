@@ -18,7 +18,14 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 const ENTRY = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 const SENTINELS = ['smoke-user-sentinel-7f3a', 'smoke-pass-sentinel-9c1e'];
-const EXPECTED_TOOLS = ['get_dropoff_time', 'get_pickup_time', 'get_schedule', 'get_week_schedule'];
+const EXPECTED_TOOLS = [
+  'get_dropoff_time',
+  'get_homework',
+  'get_pickup_time',
+  'get_schedule',
+  'get_tests',
+  'get_week_schedule',
+];
 const TIMEOUT_MS = 20_000;
 
 function check(condition, label) {
@@ -63,7 +70,7 @@ async function main() {
     const { tools } = await client.listTools();
     check(
       JSON.stringify(tools.map((tool) => tool.name).sort()) === JSON.stringify(EXPECTED_TOOLS),
-      'listTools returns exactly the four tools'
+      'listTools returns exactly the six tools'
     );
 
     let unknownRejected = false;
@@ -83,11 +90,27 @@ async function main() {
       'an invalid date is INVALID_ARGUMENT'
     );
 
+    const tooLong = await client.callTool({
+      name: 'get_homework',
+      arguments: { from: '2026-11-01', to: '2026-12-15' },
+    });
+    check(
+      tooLong.isError === true && textOf(tooLong).startsWith('[INVALID_ARGUMENT]'),
+      'a range over 31 days is INVALID_ARGUMENT'
+    );
+
     const today = await client.callTool({ name: 'get_schedule', arguments: { date: 'today' } });
     check(
       today.isError === true && textOf(today).startsWith('[NOT_LOGGED_IN]'),
       'without a session get_schedule is NOT_LOGGED_IN'
     );
+    for (const name of ['get_homework', 'get_tests']) {
+      const result = await client.callTool({ name, arguments: {} });
+      check(
+        result.isError === true && textOf(result).startsWith('[NOT_LOGGED_IN]'),
+        `without a session ${name} is NOT_LOGGED_IN`
+      );
+    }
     check(!stderr.includes('"event":"browser_launched"'), 'no browser was started');
   } finally {
     clearTimeout(timer);

@@ -36,6 +36,12 @@ const throwingClient: ScheduleClient = {
   getLastClass: async () => {
     throw hostileError();
   },
+  getHomework: async () => {
+    throw hostileError();
+  },
+  getTests: async () => {
+    throw hostileError();
+  },
 };
 
 interface Captured {
@@ -89,6 +95,8 @@ async function callAllTools(client: Client): Promise<string> {
     ['get_week_schedule', {}],
     ['get_dropoff_time', { date: 'tomorrow' }],
     ['get_pickup_time', { date: '2026-11-13' }],
+    ['get_homework', {}],
+    ['get_tests', { from: 'today', to: '2026-11-20' }],
   ] as const) {
     results.push(await client.callTool({ name, arguments: args }));
   }
@@ -129,6 +137,8 @@ describe('secret-safe errors and logs', () => {
     assertNoSecrets(everything);
     // The client still learns that it failed, with a stable code.
     assert.match(toolOutput, /\[INTERNAL\]/);
+    // Every tool, including homework and tests, reached the hostile client.
+    assert.equal(toolOutput.match(/\[INTERNAL\]/g)?.length, 6);
     assert.match(toolOutput, /"isError":true/);
     // And the failure was logged as an event with that code.
     assert.match(captured.text(), /"event":"tool_failed"/);
@@ -185,6 +195,21 @@ describe('secret-safe errors and logs', () => {
     assert.equal(parsed.code, 'INTERNAL');
     assert.equal(parsed.status, 500);
     assert.equal(typeof parsed.ts, 'string');
+  });
+
+  it('accepts the new tool names as fixed log tags', () => {
+    const lines: string[] = [];
+    setLogSink((line) => lines.push(line));
+    try {
+      logEvent('tool_called', { tool: 'get_homework' });
+      logEvent('tool_called', { tool: 'get_tests' });
+    } finally {
+      setLogSink(undefined);
+    }
+    assert.deepEqual(
+      lines.map((line) => JSON.parse(line).tool),
+      ['get_homework', 'get_tests']
+    );
   });
 
   it('writes debug events only when debug is enabled', () => {
