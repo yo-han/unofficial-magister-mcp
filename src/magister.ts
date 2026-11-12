@@ -535,7 +535,6 @@ export class MagisterClient {
 
         try {
           const scheduleUrl = `/api/personen/${userId}/afspraken?status=1&van=${dateStr}&tot=${dateStr}`;
-          console.log('Fetching:', scheduleUrl);
 
           const headers: Record<string, string> = {
             Accept: 'application/json',

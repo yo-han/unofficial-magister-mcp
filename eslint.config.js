@@ -23,6 +23,17 @@ export default tseslint.config(
     },
   },
   {
+    // stdout is reserved for JSON-RPC; all diagnostics go through src/logger.ts.
+    files: ['src/**/*.ts'],
+    rules: { 'no-console': 'error' },
+  },
+  {
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      globals: { process: 'readonly', console: 'readonly', URL: 'readonly' },
+    },
+  },
+  {
     ignores: ['dist/**', 'node_modules/**', '*.config.js', '*.config.ts'],
   }
 );
