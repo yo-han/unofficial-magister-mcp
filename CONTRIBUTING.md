@@ -18,8 +18,8 @@ Thank you for your interest in contributing! This document provides guidelines f
 3. **Set up environment**
    ```bash
    cp .env.example .env
-   # Edit .env with your Magister credentials
    ```
+   Set `MAGISTER_SCHOOL` in `.env`, then log in with `npm run build && node dist/index.js login`.
 
 4. **Run in development mode**
    ```bash
@@ -45,6 +45,17 @@ npm run type-check
 ```
 
 Pre-commit hooks will automatically run linting and formatting on staged files.
+
+## Tests
+
+```bash
+npx playwright install chromium
+npm run build
+npm test
+npm run smoke
+```
+
+Tests use a synthetic Magister fixture and never contact Magister or use real credentials.
 
 ## Commit Messages
 
