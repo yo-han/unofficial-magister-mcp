@@ -38,7 +38,6 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_SESSION_MAX_AGE_DAYS = 30;
 const SCHOOL_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const MAGISTER_SUFFIX = '.magister.net';
-const RESERVED_LABELS = new Set(['accounts', 'www']);
 const SHARED_TMP_DIRS = ['/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp'];
 
 export function defaultConfigOptions(): ConfigOptions {
@@ -72,7 +71,7 @@ export function parseSchool(input: string): string {
   } else {
     label = host;
   }
-  if (!SCHOOL_LABEL.test(label) || label.startsWith('xn--') || RESERVED_LABELS.has(label)) {
+  if (!SCHOOL_LABEL.test(label) || label.startsWith('xn--')) {
     throw fail();
   }
   const canonical = `https://${label}${MAGISTER_SUFFIX}`;
