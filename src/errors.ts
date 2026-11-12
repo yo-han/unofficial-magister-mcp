@@ -8,7 +8,7 @@
 export const PUBLIC_ERROR_MESSAGES = {
   CONFIG_INVALID: 'The server configuration is invalid.',
   INVALID_ARGUMENT:
-    'Invalid argument. Use "today", "tomorrow", a weekday name or a YYYY-MM-DD date.',
+    'Invalid argument. Use "today", "tomorrow", a weekday name or a YYYY-MM-DD date. Ranges are inclusive, from must not be after to, at most 31 days.',
   UNKNOWN_TOOL: 'Unknown tool.',
   NOT_LOGGED_IN: 'Not logged in to Magister. Run `unofficial-magister-mcp login` first.',
   SESSION_EXPIRED:

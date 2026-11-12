@@ -13,6 +13,8 @@ import { logEvent, SafeTag } from './logger.js';
  */
 
 const MAX_BODY_CHARS = 5 * 1024 * 1024;
+/** More appointments than this in one response is treated as an invalid response. */
+export const MAX_APPOINTMENTS = 2000;
 
 export const AccountSchema = z.object({
   Persoon: z.object({ Id: z.number().int().positive() }),
@@ -46,13 +48,32 @@ export const AppointmentSchema = z.object({
   Uitval: z.boolean().nullish(),
   Vervallen: z.boolean().nullish(),
   Inhoud: z.string().nullish(),
+  /** AfspraakInfoType: 1 homework, 2-5 tests, 0/6/7 other. */
+  InfoType: z.number().int().nonnegative().nullish(),
+  Afgerond: z.boolean().nullish(),
 });
 
 export type Appointment = z.infer<typeof AppointmentSchema>;
 
+const AppointmentList = z.array(AppointmentSchema).max(MAX_APPOINTMENTS);
+
+/**
+ * A list envelope must contain everything it advertises: a TotalCount above
+ * the returned items would mean a silently incomplete result. `Links` (paging)
+ * is never read or followed.
+ */
 export const AppointmentsSchema = z
-  .union([z.object({ Items: z.array(AppointmentSchema) }), z.array(AppointmentSchema)])
+  .union([
+    z
+      .object({ Items: AppointmentList, TotalCount: z.number().int().nonnegative().optional() })
+      .refine((value) => value.TotalCount === undefined || value.TotalCount <= value.Items.length),
+    AppointmentList,
+  ])
   .transform((value) => (Array.isArray(value) ? value : value.Items));
+
+export function isCancelled(appt: Appointment): boolean {
+  return appt.Status === 5 || appt.Uitval === true || appt.Vervallen === true;
+}
 
 export type ApiEndpoint = Extract<SafeTag, 'account' | 'children' | 'schedule'>;
 

@@ -36,12 +36,14 @@ describe('MCP over stdio with the synthetic Magister fixture', { timeout: 60_000
     await client?.close();
   });
 
-  it('lists exactly the four tools', async () => {
+  it('lists exactly the six tools', async () => {
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name).sort(), [
       'get_dropoff_time',
+      'get_homework',
       'get_pickup_time',
       'get_schedule',
+      'get_tests',
       'get_week_schedule',
     ]);
   });
@@ -103,6 +105,51 @@ describe('MCP over stdio with the synthetic Magister fixture', { timeout: 60_000
       textOf(cancelled),
       'No classes on Tue Nov 17 2026 - cancelled (Alle lessen vervallen i.v.m. studiedag)'
     );
+  });
+
+  it('get_homework without arguments covers 14 days from today', async () => {
+    const result = await client.callTool({ name: 'get_homework', arguments: {} });
+    assert.equal(result.isError, undefined);
+    assert.equal(
+      textOf(result),
+      [
+        'Homework from Mon Nov 16 2026 to Sun Nov 29 2026:',
+        '',
+        'Thu Nov 19 2026 09:20 - 10:10: Engels (Huiswerk)',
+        '  Completed: no',
+        '  Content:',
+        '    Maak opgave 5',
+        '',
+        '    Lees & vat samen',
+        '',
+        'Fri Nov 20 2026 10:00 - 10:50: Wiskunde (Huiswerk)',
+        '  Completed: yes',
+        '  Content: (no content)',
+      ].join('\n')
+    );
+  });
+
+  it('get_tests returns tests in an explicit range', async () => {
+    const result = await client.callTool({
+      name: 'get_tests',
+      arguments: { from: '2026-11-19', to: '2026-11-20' },
+    });
+    assert.equal(
+      textOf(result),
+      [
+        'Tests from Thu Nov 19 2026 to Fri Nov 20 2026:',
+        '',
+        'Fri Nov 20 2026 08:30 - 09:20: Biologie (Proefwerk)',
+        '  Completed: unknown',
+        '  Content:',
+        '    Proefwerk H3',
+      ].join('\n')
+    );
+    const none = await client.callTool({
+      name: 'get_tests',
+      arguments: { from: '2026-11-16', to: '2026-11-18' },
+    });
+    assert.equal(textOf(none), 'No tests found from Mon Nov 16 2026 to Wed Nov 18 2026.');
   });
 
   it('never wrote the synthetic password to stderr', () => {

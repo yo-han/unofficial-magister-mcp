@@ -1,6 +1,6 @@
 # unofficial-magister-mcp
 
-An MCP (Model Context Protocol) server for accessing Dutch school schedules from [Magister](https://www.magister.net). Enables Claude and other MCP-compatible AI assistants to query school schedules, drop-off times, and pick-up times.
+An MCP (Model Context Protocol) server for accessing Dutch school schedules from [Magister](https://www.magister.net). Enables Claude and other MCP-compatible AI assistants to query school schedules, drop-off times, pick-up times, homework and tests (read-only).
 
 > **Note:** This is an unofficial package and is not affiliated with Magister or Iddink Group.
 
@@ -19,6 +19,7 @@ No more app switching. Just ask and plan.
 
 - **Schedule queries** - Get daily or weekly school schedules
 - **Drop-off/pick-up times** - Quickly find first and last class times for planning
+- **Homework and tests** - Read-only list of homework and tests from the Magister agenda
 - **Parent account support** - Works with both student and parent accounts
 - **Interactive login** - You log in yourself (including MFA) in a browser window; the server never needs your password
 - **Private session storage** - The session is stored per account with owner-only permissions, outside the package
@@ -140,6 +141,12 @@ are not added to tool results or logs. Tokens and raw API responses are not
 logged. Lesson and cancellation text comes from Magister and may itself contain
 personal information.
 
+`get_homework` and `get_tests` additionally return, per item, the subject, the
+type, whether it is completed (when Magister says) and the assignment text as
+plain text. That text is written by teachers and reaches the model; it may
+contain names or other personal information. Links, attachments and images in
+it are dropped and never loaded.
+
 Logs go to stderr as one JSON event per line, with fixed event names and no
 free text, URLs or error messages.
 
@@ -191,16 +198,74 @@ Get the last class end time for pick-up planning.
 Last class on Mon Jan 06 2025: History ends at 15:45 @ Room 301
 ```
 
+### `get_homework`
+
+Get homework from the Magister agenda for a period.
+
+**Parameters** (both optional):
+- `from`: first day, default today
+- `to`: last day, default 13 days after `from`
+
+Both accept "today", "tomorrow", a weekday name (its next occurrence, counted
+from today) or YYYY-MM-DD, in Europe/Amsterdam. The period is inclusive and at
+most 31 days; `from` after `to` (for example `friday` to `monday` when Monday
+comes first) is `[INVALID_ARGUMENT]`.
+
+**Examples:** `{}` (the next 14 days) or `{ "from": "2026-11-16", "to": "2026-11-22" }`.
+
+**Example response:**
+```
+Homework from Mon Nov 16 2026 to Sun Nov 22 2026:
+
+Thu Nov 19 2026 09:20 - 10:10: English (Huiswerk)
+  Completed: no
+  Content:
+    Exercise 5
+
+Fri Nov 20 2026 10:00 - 10:50: Mathematics (Huiswerk) [CANCELLED]
+  Completed: unknown
+  Content: (no content)
+```
+
+`Completed` is `yes`, `no` or `unknown` (Magister did not say). Completed and
+cancelled items stay in the list. HTML in the assignment is turned into plain
+text (paragraphs, line breaks and list items are kept); scripts, styles,
+embedded content, link targets and images are dropped, and very long texts are
+cut at 10,000 characters with `… [truncated]`. Markup is parsed as a browser
+would, so an embedded element that is never closed hides the text after it; the
+text then ends with `[Text after an unclosed embedded element was omitted.]`.
+
+### `get_tests`
+
+Get tests from the Magister agenda for a period. Same parameters, defaults and
+output as `get_homework`; the type is one of:
+
+| Magister InfoType | Type |
+|---|---|
+| 2 | Proefwerk |
+| 3 | Tentamen |
+| 4 | Schriftelijke overhoring |
+| 5 | Mondelinge overhoring |
+
+Homework is InfoType 1. Other agenda items (information, notes) are not
+returned by either tool.
+
+**Scope:** both tools read agenda items (the same API call as the schedule).
+Separate ELO assignments ("Opdrachten") are not fetched, and nothing is ever
+marked as done or submitted.
+
 ## How It Works
 
 1. **Login**: `login` opens Chromium; the access token is taken from the OIDC callback on your school origin only (never an `id_token`)
 2. **Session**: Stored privately per account; restored headless and checked against `/api/account` (a different account is `[SESSION_MISMATCH]`)
 3. **Refresh**: An expired token is renewed silently through the existing Magister session; if that needs a login form, you get `[SESSION_EXPIRED]`
 4. **API access**: Requests go to your exact school origin, never follow redirects, and responses are schema-validated
-5. **Caching**: In memory only, per account and child, 5 minutes fresh, at most 30 minutes stale
+5. **Caching**: In memory only, per account and child, one entry per day (at most 64 days, least recently used first out), 5 minutes fresh, at most 30 minutes stale; the schedule, homework and tests share one cache, so asking for all three over the same days within those 5 minutes costs one API call (a stale hit is answered from the cache and refreshed with one call in the background)
 
 A Magister error is reported as an error (`[UPSTREAM_UNAVAILABLE]` or
-`[UPSTREAM_INVALID_RESPONSE]`), never as an empty schedule.
+`[UPSTREAM_INVALID_RESPONSE]`), never as an empty schedule. A response that
+announces more items than it contains (`TotalCount`), or more than 2,000 items,
+is `[UPSTREAM_INVALID_RESPONSE]` rather than a silently incomplete list.
 
 ## Parent Accounts
 
@@ -226,6 +291,13 @@ Run the `login` command (see above) with the same `MAGISTER_SCHOOL` and
 The login tried to leave the allowed origins. If your school uses an SSO
 provider, add its origin to `MAGISTER_SSO_ORIGINS`.
 
+### New tools do not show up
+
+MCP clients (Claude Code, Claude Desktop, Codex) read the tool list when they
+start the server. After updating, run `npm run build` and restart the client.
+No credentials belong in the client configuration; the server keeps using the
+stored session.
+
 ### Cleaning up files from older versions
 
 Before these hardening changes, the server stored state in the package directory and wrote a log and
@@ -247,9 +319,10 @@ authentication works. To check against your own account:
    with `npx @modelcontextprotocol/inspector node /absolute/path/to/dist/index.js`
    and the same environment variables.
 3. Call each tool: `get_schedule` (`today` and a date with known lessons),
-   `get_week_schedule`, `get_dropoff_time`, `get_pickup_time`.
-4. Treat "No classes scheduled" (an empty day) and a `[CODE]` error as
-   different outcomes; report them separately.
+   `get_week_schedule`, `get_dropoff_time`, `get_pickup_time`, `get_homework`
+   and `get_tests` (`{}` and a period with known homework or tests).
+4. Treat "No classes scheduled" or "No homework found" (an empty period) and a
+   `[CODE]` error as different outcomes; report them separately.
 5. Do not paste real responses into GitHub issues: they contain your child's
    schedule.
 

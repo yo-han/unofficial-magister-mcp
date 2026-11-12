@@ -4,7 +4,9 @@ import {
   addDays,
   amsterdamDateOf,
   formatDisplayDate,
+  MAX_RANGE_DAYS,
   resolveDate,
+  resolveRange,
   weekRange,
 } from '../src/dates.js';
 import { PublicError } from '../src/errors.js';
@@ -98,5 +100,96 @@ describe('date helpers', () => {
     assert.equal(amsterdamDateOf('2026-11-11T23:00:00Z'), '2026-11-12');
     assert.equal(amsterdamDateOf('2026-11-11T22:59:59Z'), '2026-11-11');
     assert.equal(amsterdamDateOf('2026-07-14T22:00:00+00:00'), '2026-07-15');
+  });
+});
+
+describe('resolveRange', () => {
+  const now = new Date('2026-11-12T10:00:00Z'); // Thursday in Amsterdam
+
+  function expectRangeInvalid(from: string | undefined, to: string | undefined, at = now) {
+    assert.throws(
+      () => resolveRange(from, to, at),
+      (error: unknown) => error instanceof PublicError && error.code === 'INVALID_ARGUMENT'
+    );
+  }
+
+  function assertConsecutive(dates: string[]) {
+    for (let index = 1; index < dates.length; index += 1) {
+      assert.equal(dates[index], addDays(dates[index - 1], 1));
+    }
+    assert.equal(new Set(dates).size, dates.length);
+  }
+
+  it('defaults to today through today+13 (14 inclusive days)', () => {
+    const dates = resolveRange(undefined, undefined, now);
+    assert.equal(dates.length, 14);
+    assert.equal(dates[0], '2026-11-12');
+    assert.equal(dates[13], '2026-11-25');
+    assertConsecutive(dates);
+  });
+
+  it('defaults to to from+13 and from to today', () => {
+    const fromOnly = resolveRange('2026-12-01', undefined, now);
+    assert.equal(fromOnly.length, 14);
+    assert.deepEqual([fromOnly[0], fromOnly[13]], ['2026-12-01', '2026-12-14']);
+    const toOnly = resolveRange(undefined, '2026-11-15', now);
+    assert.deepEqual(toOnly, ['2026-11-12', '2026-11-13', '2026-11-14', '2026-11-15']);
+  });
+
+  it('accepts a single day and exactly 31 days', () => {
+    assert.deepEqual(resolveRange('2026-11-16', '2026-11-16', now), ['2026-11-16']);
+    const month = resolveRange('2026-12-01', '2026-12-31', now);
+    assert.equal(MAX_RANGE_DAYS, 31);
+    assert.equal(month.length, 31);
+    assert.deepEqual([month[0], month[30]], ['2026-12-01', '2026-12-31']);
+    assertConsecutive(month);
+  });
+
+  it('rejects 32 days and far larger ranges', () => {
+    expectRangeInvalid('2026-12-01', '2027-01-01');
+    expectRangeInvalid('1970-01-01', '2999-12-31');
+  });
+
+  it('rejects a reversed range', () => {
+    expectRangeInvalid('2026-11-20', '2026-11-19');
+    expectRangeInvalid(undefined, '2026-11-11');
+  });
+
+  it('accepts the date aliases in both fields', () => {
+    assert.deepEqual(resolveRange('today', 'tomorrow', now), ['2026-11-12', '2026-11-13']);
+    assert.deepEqual(resolveRange('tomorrow', 'saturday', now), ['2026-11-13', '2026-11-14']);
+    // "monday" is the next Monday (Nov 16), so friday..monday is Nov 13..16.
+    assert.equal(resolveRange('friday', 'monday', now).length, 4);
+    // A weekday a week ahead resolves later than "today".
+    expectRangeInvalid('thursday', 'today');
+  });
+
+  it('rejects invalid calendar dates and unknown words', () => {
+    expectRangeInvalid('2026-02-30', undefined);
+    expectRangeInvalid(undefined, '2026-02-30');
+    expectRangeInvalid('next week', undefined);
+    expectRangeInvalid('', undefined);
+  });
+
+  it('rejects a default end beyond the supported year domain', () => {
+    expectRangeInvalid('2999-12-25', undefined);
+    assert.equal(resolveRange('2999-12-18', undefined, now).at(-1), '2999-12-31');
+  });
+
+  it('starts at the Amsterdam date, not the UTC date', () => {
+    const dates = resolveRange(undefined, undefined, new Date('2026-01-14T23:30:00Z'));
+    assert.equal(dates[0], '2026-01-15');
+    assert.equal(dates[13], '2026-01-28');
+  });
+
+  it('enumerates ranges across both DST changes without gaps or duplicates', () => {
+    const spring = resolveRange('2026-03-20', '2026-04-05', now);
+    assert.equal(spring.length, 17);
+    assert.ok(spring.includes('2026-03-29') && spring.includes('2026-03-30'));
+    assertConsecutive(spring);
+    const autumn = resolveRange('2026-10-20', '2026-11-05', now);
+    assert.equal(autumn.length, 17);
+    assert.ok(autumn.includes('2026-10-25') && autumn.includes('2026-10-26'));
+    assertConsecutive(autumn);
   });
 });

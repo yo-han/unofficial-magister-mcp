@@ -40,6 +40,8 @@ export interface FixtureOptions {
   scheduleRedirect: string | null;
   /** Answer the schedule endpoint with a body that does not match the schema. */
   scheduleInvalid: boolean;
+  /** Advertise this TotalCount instead of the number of returned items. */
+  totalCountOverride: number | null;
   /** Delay before the authorize endpoint redirects back with tokens. */
   authorizeDelayMs: number;
   /** Lifetime of issued access tokens in seconds (negative = already expired). */
@@ -58,6 +60,8 @@ export interface Appointment {
   Lokatie?: string | null;
   Status?: number;
   Inhoud?: string | null;
+  InfoType?: number | null;
+  Afgerond?: boolean | null;
   [key: string]: unknown;
 }
 
@@ -92,6 +96,7 @@ export function createFixtureState(overrides: Partial<FixtureOptions> = {}): Fix
       appRedirect: null,
       scheduleRedirect: null,
       scheduleInvalid: false,
+      totalCountOverride: null,
       authorizeDelayMs: 0,
       tokenLifetimeSec: 3600,
       appointments: new Map(),
@@ -157,6 +162,18 @@ export function lesson(
     Id: Math.floor(Math.random() * 1e6),
     ...extra,
   };
+}
+
+/** A synthetic agenda item with an AfspraakInfoType (1 homework, 2-5 tests, 6/7 other). */
+export function assignment(
+  date: string,
+  start: string,
+  end: string,
+  subject: string,
+  infoType: number,
+  extra: Partial<Appointment> = {}
+): Appointment {
+  return lesson(date, start, end, subject, { InfoType: infoType, ...extra });
 }
 
 export function allDayNotice(date: string, nextDate: string, text: string): Appointment {
@@ -329,7 +346,8 @@ async function handleSchool(route: Route, url: URL, state: FixtureState) {
       .filter(([date]) => date >= van && date <= tot)
       .sort(([a], [b]) => a.localeCompare(b))
       .flatMap(([, list]) => list);
-    return json(route, 200, { Items: items, TotalCount: items.length, Links: [] });
+    const totalCount = options.totalCountOverride ?? items.length;
+    return json(route, 200, { Items: items, TotalCount: totalCount, Links: [] });
   }
   return json(route, 404, {});
 }

@@ -9,13 +9,14 @@ import {
   refreshToken,
   resolveChild,
 } from './auth.js';
+import { AssignmentItem, toHomework, toTests } from './assignments.js';
 import { BrowserSession, ClientDeps, DEFAULT_TIMEOUTS } from './browser-session.js';
 import { cacheKey, ScheduleCache } from './cache.js';
 import type { Config } from './config.js';
-import { amsterdamDateOf, CalendarDate } from './dates.js';
+import { amsterdamDateOf, CalendarDate, formatAmsterdamTime } from './dates.js';
 import { PublicError } from './errors.js';
 import { logEvent } from './logger.js';
-import { Appointment, AppointmentsSchema } from './magister-api.js';
+import { Appointment, AppointmentsSchema, isCancelled } from './magister-api.js';
 import { ClassResult, firstClass, lastClass, ScheduleItem } from './schedule.js';
 import type { ScheduleClient } from './server.js';
 import type { AccountStore, StoredSession } from './storage.js';
@@ -43,20 +44,14 @@ interface ActiveSession extends Identity {
   stored: StoredSession | null;
 }
 
-const timeFormat = new Intl.DateTimeFormat('nl-NL', {
-  hour: '2-digit',
-  minute: '2-digit',
-  timeZone: 'Europe/Amsterdam',
-});
-
 export function toScheduleItem(appt: Appointment): ScheduleItem {
   return {
-    startTime: timeFormat.format(new Date(appt.Start)),
-    endTime: timeFormat.format(new Date(appt.Einde)),
+    startTime: formatAmsterdamTime(appt.Start),
+    endTime: formatAmsterdamTime(appt.Einde),
     subject: appt.Omschrijving || appt.Vakken?.[0]?.Naam || 'Unknown',
     teacher: appt.Docenten?.[0]?.Naam ?? undefined,
     location: appt.Lokalen?.[0]?.Naam || appt.Lokatie || undefined,
-    cancelled: appt.Status === 5 || appt.Uitval === true || appt.Vervallen === true,
+    cancelled: isCancelled(appt),
     description: appt.Inhoud ?? undefined,
   };
 }
@@ -73,7 +68,7 @@ export function toScheduleItem(appt: Appointment): ScheduleItem {
  */
 export class MagisterClient implements ScheduleClient {
   private readonly deps: ClientDeps;
-  private readonly cache = new ScheduleCache<ScheduleItem[]>();
+  private readonly cache = new ScheduleCache<Appointment[]>();
   private ready: Promise<ActiveSession> | null = null;
   private active: ActiveSession | null = null;
   private refreshing: Promise<void> | null = null;
@@ -277,11 +272,11 @@ export class MagisterClient implements ScheduleClient {
     return cacheKey(active.accountPersonId, this.personFor(active), date);
   }
 
-  /** Fetches [from, to] in one call and caches every date in the range. */
-  private async fetchRange(
+  /** Fetches [from, to] in one call and caches the validated appointments of every date. */
+  private async fetchAppointments(
     active: ActiveSession,
     dates: CalendarDate[]
-  ): Promise<Record<CalendarDate, ScheduleItem[]>> {
+  ): Promise<Record<CalendarDate, Appointment[]>> {
     const generation = this.cache.generation;
     const from = dates[0];
     const to = dates[dates.length - 1];
@@ -291,26 +286,23 @@ export class MagisterClient implements ScheduleClient {
       active.browser.api.get('schedule', path, AppointmentsSchema, token)
     );
 
-    const byDate: Record<CalendarDate, ScheduleItem[]> = {};
+    const byDate: Record<CalendarDate, Appointment[]> = {};
     for (const date of dates) byDate[date] = [];
     for (const appt of appointments) {
-      const date = amsterdamDateOf(appt.Start);
-      byDate[date]?.push(toScheduleItem(appt));
+      byDate[amsterdamDateOf(appt.Start)]?.push(appt);
     }
     for (const date of dates) this.cache.set(this.keyFor(active, date), byDate[date], generation);
     return byDate;
   }
 
   private refreshInBackground(active: ActiveSession, dates: CalendarDate[]): void {
-    this.fetchRange(active, dates).catch(() => logEvent('cache_refresh_failed', {}, 'warn'));
+    this.fetchAppointments(active, dates).catch(() => logEvent('cache_refresh_failed', {}, 'warn'));
   }
 
-  async getSchedule(date: CalendarDate): Promise<ScheduleItem[]> {
-    return (await this.getWeekSchedule([date]))[date];
-  }
-
-  /** Schedules for consecutive dates, with one API call when anything is missing. */
-  async getWeekSchedule(dates: CalendarDate[]): Promise<Record<CalendarDate, ScheduleItem[]>> {
+  /** Appointments for consecutive dates, with one API call when anything is missing. */
+  private async appointmentsFor(
+    dates: CalendarDate[]
+  ): Promise<Record<CalendarDate, Appointment[]>> {
     if (dates.length === 0) return {};
     const active = await this.session();
     const hits = dates.map((date) => this.cache.get(this.keyFor(active, date)));
@@ -319,7 +311,29 @@ export class MagisterClient implements ScheduleClient {
       if (hits.some((hit) => !hit?.fresh)) this.refreshInBackground(active, dates);
       return Object.fromEntries(dates.map((date, index) => [date, hits[index]!.value]));
     }
-    return this.fetchRange(active, dates);
+    return this.fetchAppointments(active, dates);
+  }
+
+  async getSchedule(date: CalendarDate): Promise<ScheduleItem[]> {
+    return (await this.getWeekSchedule([date]))[date];
+  }
+
+  /** Schedules for consecutive dates, with one API call when anything is missing. */
+  async getWeekSchedule(dates: CalendarDate[]): Promise<Record<CalendarDate, ScheduleItem[]>> {
+    const byDate = await this.appointmentsFor(dates);
+    return Object.fromEntries(dates.map((date) => [date, byDate[date].map(toScheduleItem)]));
+  }
+
+  /** Homework on consecutive dates, in chronological order. */
+  async getHomework(dates: CalendarDate[]): Promise<AssignmentItem[]> {
+    const byDate = await this.appointmentsFor(dates);
+    return toHomework(dates.flatMap((date) => byDate[date]));
+  }
+
+  /** Tests on consecutive dates, in chronological order. */
+  async getTests(dates: CalendarDate[]): Promise<AssignmentItem[]> {
+    const byDate = await this.appointmentsFor(dates);
+    return toTests(dates.flatMap((date) => byDate[date]));
   }
 
   async getFirstClass(date: CalendarDate): Promise<ClassResult> {

@@ -10,7 +10,7 @@ import { interactiveLogin } from '../../src/auth.js';
 import { MagisterClient } from '../../src/magister.js';
 import { createServer } from '../../src/server.js';
 import { createHarness } from './harness.js';
-import { allDayNotice, CHILD_A, lesson, setAppointments } from './magister-routes.js';
+import { allDayNotice, assignment, CHILD_A, lesson, setAppointments } from './magister-routes.js';
 
 const now = new Date(process.env.FIXTURE_NOW ?? '2026-11-16T07:00:00Z');
 
@@ -22,6 +22,17 @@ setAppointments(harness.state, CHILD_A, '2026-11-16', [
 ]);
 setAppointments(harness.state, CHILD_A, '2026-11-17', [
   allDayNotice('2026-11-17', '2026-11-18', 'Alle lessen vervallen i.v.m. studiedag'),
+]);
+// Homework and tests on other days, so the schedule of Nov 16 and 17 is unchanged.
+setAppointments(harness.state, CHILD_A, '2026-11-19', [
+  assignment('2026-11-19', '09:20', '10:10', 'Engels', 1, {
+    Afgerond: false,
+    Inhoud: '<p>Maak opgave 5</p><p>Lees &amp; vat samen</p>',
+  }),
+]);
+setAppointments(harness.state, CHILD_A, '2026-11-20', [
+  assignment('2026-11-20', '08:30', '09:20', 'Biologie', 2, { Inhoud: 'Proefwerk H3' }),
+  assignment('2026-11-20', '10:00', '10:50', 'Wiskunde', 1, { Afgerond: true }),
 ]);
 await interactiveLogin(harness.deps);
 
