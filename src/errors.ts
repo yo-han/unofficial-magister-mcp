@@ -59,3 +59,12 @@ export class PublicError extends Error {
     return `[${this.code}] ${this.message}${suffix}`;
   }
 }
+
+/**
+ * Maps any thrown value to something safe to show. A PublicError passes
+ * through; everything else becomes INTERNAL without keeping the original
+ * message or cause.
+ */
+export function toPublicError(error: unknown): PublicError {
+  return error instanceof PublicError ? error : new PublicError('INTERNAL');
+}

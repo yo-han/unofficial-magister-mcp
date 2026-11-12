@@ -1,14 +1,17 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'fs';
-import { join, dirname } from 'path';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { CalendarDate } from './dates.js';
+import { PublicError } from './errors.js';
+import { logEvent } from './logger.js';
+import { ClassResult, firstClass, lastClass, ScheduleItem } from './schedule.js';
+import { ScheduleClient } from './server.js';
+import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const AUTH_STATE_PATH = join(__dirname, '..', '.auth-state.json');
 const CACHE_PATH = join(__dirname, '..', '.schedule-cache.json');
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-const LOG_FILE = '/tmp/magister-mcp.log';
 
 // Simple cache structure
 interface CacheEntry {
@@ -41,7 +44,6 @@ class ScheduleCache {
     try {
       if (existsSync(CACHE_PATH)) {
         this.cache = JSON.parse(readFileSync(CACHE_PATH, 'utf-8'));
-        log('Cache loaded from disk');
       }
     } catch {
       this.cache = {};
@@ -79,35 +81,13 @@ class ScheduleCache {
 
 const scheduleCache = new ScheduleCache();
 
-function log(...args: unknown[]) {
-  const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
-  const line = `${new Date().toISOString()} ${msg}\n`;
-  appendFileSync(LOG_FILE, line);
-  process.stderr.write(line);
-}
-
-export interface ScheduleItem {
-  startTime: string;
-  endTime: string;
-  subject: string;
-  teacher?: string;
-  location?: string;
-  cancelled: boolean;
-  description?: string;
-}
-
-export interface ClassResult {
-  class: ScheduleItem | null;
-  cancellationReason: string | null;
-}
-
 export interface MagisterConfig {
   school: string;
   username: string;
   password: string;
 }
 
-export class MagisterClient {
+export class MagisterClient implements ScheduleClient {
   private config: MagisterConfig;
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
@@ -125,13 +105,11 @@ export class MagisterClient {
   }
 
   async init(): Promise<void> {
-    log('Initializing Magister client...');
     this.browser = await chromium.launch({ headless: true });
 
     // Try to restore previous session from disk
     if (existsSync(AUTH_STATE_PATH)) {
       try {
-        log('Found saved auth state, attempting to restore...');
         const storageState = JSON.parse(readFileSync(AUTH_STATE_PATH, 'utf-8'));
         this.context = await this.browser.newContext({ storageState });
         this.page = await this.context.newPage();
@@ -140,7 +118,6 @@ export class MagisterClient {
         if (storageState._magister) {
           this.userId = storageState._magister.userId;
           this.accessToken = storageState._magister.accessToken;
-          log('Restored userId:', this.userId, 'token:', this.accessToken ? 'yes' : 'no');
         }
 
         // Verify session is still valid by trying the API
@@ -150,12 +127,10 @@ export class MagisterClient {
         // Quick check if we're logged in
         const url = this.page.url();
         if (!url.includes('accounts.magister.net') && this.userId) {
-          log('Session restored successfully!');
           return; // Session is valid, skip login
         }
-        log('Saved session expired, need to re-login');
-      } catch (e) {
-        log('Failed to restore session:', e);
+      } catch {
+        logEvent('session_expired', {}, 'warn');
       }
     }
 
@@ -164,48 +139,31 @@ export class MagisterClient {
     this.context = await this.browser.newContext();
     this.page = await this.context.newPage();
 
-    // Log all navigations for debugging
-    this.page.on('framenavigated', (frame) => {
-      if (frame === this.page?.mainFrame()) {
-        log('Navigated to:', frame.url().slice(0, 100));
-      }
-    });
-
     await this.login();
   }
 
   private async login(): Promise<void> {
-    if (!this.page) throw new Error('Page not initialized');
+    if (!this.page) throw new PublicError('INTERNAL');
 
-    log('Logging into Magister...');
     await this.page.goto(this.getBaseUrl());
 
     // Wait for redirect to accounts.magister.net and username field
     await this.page.waitForSelector('#username', { timeout: 15000 });
-    log('Username field found');
 
     // Fill username
     await this.page.fill('#username', this.config.username);
-    log('Username filled');
 
     // Click "Doorgaan" button (DNA-BUTTON web component)
     // Use text-based selector since it's a custom element
     await this.page.click(
       'dna-button:has-text("Doorgaan"), button:has-text("Doorgaan"), [type="submit"]'
     );
-    log('Clicked continue button');
 
     // Wait for password field to appear (step 2 of login)
     await this.page.waitForSelector('#password, input[type="password"]', { timeout: 15000 });
-    log('Password field found');
 
     // Fill password
     await this.page.fill('#password, input[type="password"]', this.config.password);
-    log('Password filled');
-
-    // Take screenshot to see current state
-    await this.page.screenshot({ path: '/tmp/magister-before-login.png' });
-    log('Screenshot saved to /tmp/magister-before-login.png');
 
     // Handle any cookie consent or overlay dialogs
     try {
@@ -222,27 +180,14 @@ export class MagisterClient {
       for (const selector of consentSelectors) {
         const btn = await this.page.$(selector);
         if (btn && (await btn.isVisible())) {
-          log('Found consent button:', selector);
           await btn.click();
           await this.page.waitForTimeout(500);
           break;
         }
       }
     } catch {
-      log('No consent dialog found (ok)');
+      // No consent dialog present.
     }
-
-    // Log what buttons are visible on the page
-    const buttons = await this.page.evaluate(() => {
-      const btns = document.querySelectorAll('button, dna-button, [type="submit"]');
-      return Array.from(btns).map((b) => ({
-        tag: b.tagName,
-        text: b.textContent?.trim().slice(0, 30),
-        visible: (b as HTMLElement).offsetParent !== null,
-        classes: b.className,
-      }));
-    });
-    log('Buttons on page:', buttons);
 
     // Set up listener to capture token from redirect URL before clicking
     const tokenHolder = { value: '' };
@@ -253,7 +198,6 @@ export class MagisterClient {
         url.includes('access_token') ||
         url.includes('id_token')
       ) {
-        log('Captured redirect URL:', url.slice(0, 200));
         const tokenMatch = url.match(/access_token=([^&]+)/);
         if (tokenMatch) {
           tokenHolder.value = decodeURIComponent(tokenMatch[1]);
@@ -284,45 +228,36 @@ export class MagisterClient {
         const btn = await this.page.$(selector);
         if (btn) {
           const isVisible = await btn.isVisible();
-          log(`Login button ${selector}: found=${!!btn}, visible=${isVisible}`);
           if (isVisible) {
             await btn.click({ timeout: 5000 });
-            log('Clicked login button:', selector);
             clicked = true;
             break;
           }
         }
-      } catch (e) {
-        log(`Failed to click ${selector}:`, e);
+      } catch {
+        // Selector not clickable; try the next one.
       }
     }
 
     if (!clicked) {
-      // Take screenshot of failure state
-      await this.page.screenshot({ path: '/tmp/magister-login-failed.png' });
-      log('Could not find login button! Screenshot saved to /tmp/magister-login-failed.png');
       // Try pressing Enter as last resort
       await this.page.keyboard.press('Enter');
-      log('Pressed Enter as fallback');
     }
 
     // Wait for navigation away from accounts.magister.net
     // Just wait for any URL on the school domain
     const schoolDomain = this.config.school.replace(/\.magister\.net$/, '') + '.magister.net';
-    log('Waiting for redirect to:', schoolDomain);
 
     try {
       await this.page.waitForURL(
         (url) => {
           const matches =
             url.href.includes(schoolDomain) && !url.href.includes('accounts.magister.net');
-          log('URL check:', url.href.slice(0, 80), 'matches:', matches);
           return matches;
         },
         { timeout: 30000 }
       );
     } catch {
-      log('waitForURL failed, current URL:', this.page.url());
       // Continue anyway - we might already be on the right page
     }
 
@@ -331,7 +266,6 @@ export class MagisterClient {
     // Use captured token
     if (tokenHolder.value) {
       this.accessToken = tokenHolder.value;
-      log('Access token captured:', tokenHolder.value.slice(0, 50) + '...');
     } else {
       // Fallback: try to get token from page storage
       const token = await this.page.evaluate(() => {
@@ -358,24 +292,19 @@ export class MagisterClient {
       });
       if (token) {
         this.accessToken = token;
-        log('Token from storage:', token.slice(0, 50) + '...');
       }
     }
 
     // Make sure we're on the school domain before API calls
     const currentUrl = this.page.url();
-    log('Current URL after login:', currentUrl);
 
     if (!currentUrl.includes(this.config.school.replace(/\.magister\.net$/, ''))) {
-      log('Navigating to school domain...');
       await this.page.goto(`${this.getBaseUrl()}/magister/`);
       await this.page.waitForTimeout(2000);
     }
 
     // Fetch user ID
     await this.fetchUserId();
-
-    log('Login successful! Token:', this.accessToken ? 'yes' : 'no', 'UserId:', this.userId);
 
     // Save auth state to disk for next time
     await this.saveAuthState();
@@ -395,9 +324,9 @@ export class MagisterClient {
         },
       };
       writeFileSync(AUTH_STATE_PATH, JSON.stringify(extendedState, null, 2));
-      log('Auth state saved to disk');
-    } catch (err) {
-      log('Failed to save auth state:', err);
+      logEvent('session_saved');
+    } catch {
+      logEvent('session_save_skipped', {}, 'warn');
     }
   }
 
@@ -422,12 +351,9 @@ export class MagisterClient {
         return await res.json();
       }, token);
 
-      log('Account API response:', JSON.stringify(response).slice(0, 500));
-
       // Check if this is a parent account with linked children
       if (response.Persoon?.Id) {
         const personId = response.Persoon.Id;
-        log('Logged in as person ID:', personId);
 
         // Try to get linked children (for parent accounts)
         const childrenResponse = await this.page.evaluate(
@@ -463,70 +389,54 @@ export class MagisterClient {
           { personId, token }
         );
 
-        log('Children API response:', JSON.stringify(childrenResponse).slice(0, 500));
-
         // Parse children response
         const children = childrenResponse.data?.Items || childrenResponse.data || [];
         if (Array.isArray(children) && children.length > 0) {
           // Use the first child's ID
           const child = children[0];
           this.userId = child.Id || child.Persoon?.Id || child.LeerlingId;
-          log('Using child ID:', this.userId, 'Name:', child.Naam || child.Persoon?.Naam);
         } else {
           // No children found, use the logged-in person's ID (might be a student account)
           this.userId = personId;
-          log('No children found, using own ID:', this.userId);
         }
-      } else {
-        log('Could not get user ID from response');
       }
-    } catch (e) {
-      log('Failed to fetch user ID:', e);
+    } catch {
+      logEvent('api_error', { endpoint: 'account' }, 'warn');
     }
   }
 
-  async getSchedule(date: Date): Promise<ScheduleItem[]> {
-    // Format date for API (YYYY-MM-DD format)
-    const formatDate = (d: Date) => d.toISOString().split('T')[0];
-    const dateStr = formatDate(date);
-
+  async getSchedule(dateStr: CalendarDate): Promise<ScheduleItem[]> {
     // Check cache first (SWR pattern)
     const cached = scheduleCache.get(dateStr);
     if (cached) {
       if (!cached.isStale) {
-        log(`Cache HIT for ${dateStr} (fresh)`);
         return cached.data;
       }
-      log(`Cache HIT for ${dateStr} (stale, will refresh)`);
       // Return stale data immediately, but trigger refresh in background
-      this.refreshScheduleInBackground(date, dateStr);
+      this.refreshScheduleInBackground(dateStr);
       return cached.data;
     }
 
-    log(`Cache MISS for ${dateStr}, fetching...`);
-    return this.fetchScheduleFromAPI(date, dateStr);
+    return this.fetchScheduleFromAPI(dateStr);
   }
 
-  private async refreshScheduleInBackground(date: Date, dateStr: string): Promise<void> {
+  private refreshScheduleInBackground(dateStr: CalendarDate): void {
     // Don't await - let it run in background
-    this.fetchScheduleFromAPI(date, dateStr).catch((e) => {
-      log('Background refresh failed:', e);
+    this.fetchScheduleFromAPI(dateStr).catch(() => {
+      logEvent('cache_refresh_failed', {}, 'warn');
     });
   }
 
-  private async fetchScheduleFromAPI(date: Date, dateStr: string): Promise<ScheduleItem[]> {
-    if (!this.page) throw new Error('Client not initialized. Call init() first.');
+  private async fetchScheduleFromAPI(dateStr: CalendarDate): Promise<ScheduleItem[]> {
+    if (!this.page) throw new PublicError('INTERNAL');
 
     // Try to get userId if we don't have it
     if (!this.userId) {
-      log('No userId, trying to fetch...');
       await this.fetchUserId();
       if (!this.userId) {
-        throw new Error('Could not get user ID');
+        throw new PublicError('UPSTREAM_UNAVAILABLE');
       }
     }
-
-    log(`Fetching schedule for ${dateStr} (userId: ${this.userId})`);
 
     // Make API call with cookies (and token if available)
     const apiResult = await this.page.evaluate(
@@ -561,11 +471,9 @@ export class MagisterClient {
       { dateStr, userId: this.userId, token: this.accessToken || '' }
     );
 
-    log('API result:', JSON.stringify(apiResult, null, 2).slice(0, 500));
-
     if (apiResult.error) {
-      log('API error:', apiResult.error);
-      return this.getScheduleFromDOM(date);
+      logEvent('api_error', { endpoint: 'schedule' }, 'warn');
+      return this.getScheduleFromDOM();
     }
 
     // Parse API response into ScheduleItems
@@ -598,16 +506,12 @@ export class MagisterClient {
 
     // Cache the result
     scheduleCache.set(dateStr, items);
-    log(`Cached ${items.length} items for ${dateStr}`);
 
     return items;
   }
 
-  private async getScheduleFromDOM(date: Date): Promise<ScheduleItem[]> {
+  private async getScheduleFromDOM(): Promise<ScheduleItem[]> {
     if (!this.page) return [];
-
-    const dateStr = date.toISOString().split('T')[0];
-    log('Falling back to DOM scraping for:', dateStr);
 
     // Navigate to agenda page
     await this.page.goto(`${this.getBaseUrl()}/magister/#/agenda`);
@@ -651,119 +555,20 @@ export class MagisterClient {
     return items;
   }
 
-  async getTodaySchedule(): Promise<ScheduleItem[]> {
-    return this.getSchedule(new Date());
-  }
-
-  async getTomorrowSchedule(): Promise<ScheduleItem[]> {
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    return this.getSchedule(tomorrow);
-  }
-
-  async getWeekSchedule(): Promise<Record<string, ScheduleItem[]>> {
-    const result: Record<string, ScheduleItem[]> = {};
-    const today = new Date();
-
-    for (let i = 0; i < 7; i++) {
-      const date = new Date(today);
-      date.setDate(date.getDate() + i);
-      const dateStr = date.toISOString().split('T')[0];
-      result[dateStr] = await this.getSchedule(date);
+  async getWeekSchedule(dates: CalendarDate[]): Promise<Record<CalendarDate, ScheduleItem[]>> {
+    const result: Record<CalendarDate, ScheduleItem[]> = {};
+    for (const date of dates) {
+      result[date] = await this.getSchedule(date);
     }
-
     return result;
   }
 
-  private isActualClass(item: ScheduleItem): boolean {
-    // Filter out cancelled classes
-    if (item.cancelled) return false;
-
-    const subject = item.subject.toLowerCase();
-
-    // Filter out "no class" and cancellation notices
-    if (subject.includes('geen les')) return false;
-    if (subject.includes('lesuitval')) return false;
-    if (subject.includes('vervallen')) return false;
-
-    // Informational notices often start with ! or #
-    if (item.subject.startsWith('!') || item.subject.startsWith('#')) return false;
-
-    // All-day events (00:00-00:00) are notices, not actual classes
-    if (item.startTime === '00:00' && item.endTime === '00:00') return false;
-
-    // Real classes have teachers assigned
-    if (!item.teacher) return false;
-
-    return true;
+  async getFirstClass(date: CalendarDate): Promise<ClassResult> {
+    return firstClass(await this.getSchedule(date));
   }
 
-  /**
-   * Detects school-wide cancellation notices in the schedule.
-   * Only returns a cancellation reason for all-day notices (00:00-00:00).
-   * Per-period cancellations like "geen lessen 4e uur" are ignored here.
-   */
-  private detectSchoolWideCancellation(schedule: ScheduleItem[]): string | null {
-    const cancellationPatterns = [
-      /alle lessen vervallen/i,
-      /school gesloten/i,
-      /geen lessen/i,
-      /lesuitval/i,
-      /code (oranje|rood)/i,
-    ];
-
-    for (const item of schedule) {
-      // Only consider all-day notices (00:00-00:00) as school-wide cancellations
-      if (item.startTime !== '00:00' || item.endTime !== '00:00') {
-        continue;
-      }
-
-      const textToCheck = `${item.subject} ${item.description || ''}`;
-
-      for (const pattern of cancellationPatterns) {
-        if (pattern.test(textToCheck)) {
-          return item.description || item.subject;
-        }
-      }
-    }
-
-    return null;
-  }
-
-  async getFirstClass(date: Date): Promise<ClassResult> {
-    const schedule = await this.getSchedule(date);
-    const actualClasses = schedule.filter((item) => this.isActualClass(item));
-
-    // Only report cancellation if there are no actual classes AND a cancellation notice exists
-    if (actualClasses.length === 0) {
-      const cancellationReason = this.detectSchoolWideCancellation(schedule);
-      if (cancellationReason) {
-        return { class: null, cancellationReason };
-      }
-    }
-
-    return {
-      class: actualClasses.length > 0 ? actualClasses[0] : null,
-      cancellationReason: null,
-    };
-  }
-
-  async getLastClass(date: Date): Promise<ClassResult> {
-    const schedule = await this.getSchedule(date);
-    const actualClasses = schedule.filter((item) => this.isActualClass(item));
-
-    // Only report cancellation if there are no actual classes AND a cancellation notice exists
-    if (actualClasses.length === 0) {
-      const cancellationReason = this.detectSchoolWideCancellation(schedule);
-      if (cancellationReason) {
-        return { class: null, cancellationReason };
-      }
-    }
-
-    return {
-      class: actualClasses.length > 0 ? actualClasses[actualClasses.length - 1] : null,
-      cancellationReason: null,
-    };
+  async getLastClass(date: CalendarDate): Promise<ClassResult> {
+    return lastClass(await this.getSchedule(date));
   }
 
   async close(): Promise<void> {
