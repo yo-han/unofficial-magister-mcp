@@ -22,7 +22,7 @@ const AUTHORIZE_PATH = '/connect/authorize';
 const POLL_MS = 100;
 
 const CONTINUE_SELECTOR =
-  'dna-button:has-text("Doorgaan"), button:has-text("Doorgaan"), [type="submit"]';
+  'sl-button:text-is("Doorgaan"), dna-button:has-text("Doorgaan"), button:has-text("Doorgaan"), [type="submit"]';
 const PASSWORD_SELECTOR = '#password, input[type="password"]';
 const CONSENT_SELECTORS = [
   'button:has-text("Accepteren")',
@@ -33,8 +33,9 @@ const CONSENT_SELECTORS = [
   '[class*="consent"] button',
 ];
 const LOGIN_SELECTORS = [
-  'dna-button:has-text("Inloggen")',
-  'button:has-text("Inloggen")',
+  'sl-button:text-is("Inloggen")',
+  'dna-button:text-is("Inloggen")',
+  'button:text-is("Inloggen")',
   'dna-button[type="submit"]',
   'button[type="submit"]',
   'input[type="submit"]',
@@ -146,7 +147,7 @@ interface WaitOptions {
   timeoutMs: number;
   timeoutCode: PublicErrorCode;
   /** Checked on every poll; throw to stop waiting. */
-  check?: () => void;
+  check?: () => void | Promise<void>;
 }
 
 /**
@@ -162,7 +163,7 @@ async function waitForToken(
   const deadline = Date.now() + options.timeoutMs;
   do {
     session.guard.assertTrusted();
-    options.check?.();
+    await options.check?.();
     // The user closed the login window.
     if (session.page.isClosed()) throw new PublicError(options.timeoutCode);
     if (watcher.callbackSeen && watcher.settled()) {
@@ -306,6 +307,19 @@ export async function passwordLogin(
   await page.fill('#username', username, { timeout: deps.timeouts.stepMs });
   assertCredentialOrigin(session, page);
   await page.click(CONTINUE_SELECTOR, { timeout: deps.timeouts.stepMs });
+  // Accounts with a passkey first offer a choice of sign-in method.
+  const passwordInput = page.locator(PASSWORD_SELECTOR).first();
+  const passwordChoice = page.getByText('Inloggen met wachtwoord', { exact: true }).first();
+  await session.guard.race(
+    Promise.race([
+      passwordInput.waitFor({ state: 'visible', timeout: deps.timeouts.stepMs }),
+      passwordChoice.waitFor({ state: 'visible', timeout: deps.timeouts.stepMs }),
+    ])
+  );
+  if (!(await passwordInput.isVisible()) && (await passwordChoice.isVisible())) {
+    assertCredentialOrigin(session, page);
+    await passwordChoice.click({ timeout: deps.timeouts.stepMs });
+  }
   await session.guard.race(
     page.waitForSelector(PASSWORD_SELECTOR, { timeout: deps.timeouts.stepMs })
   );
@@ -315,9 +329,32 @@ export async function passwordLogin(
   assertCredentialOrigin(session, page);
   if (!(await clickFirstVisible(page, LOGIN_SELECTORS))) await page.keyboard.press('Enter');
 
+  let mfaAttempted = false;
   const token = await waitForToken(session, watcher, {
     timeoutMs: deps.timeouts.loginMs,
     timeoutCode: 'LOGIN_FAILED',
+    check: async () => {
+      const input = page.locator('#token, input[autocomplete="one-time-code"]').first();
+      if (!(await input.isVisible())) return;
+      assertCredentialOrigin(session, page);
+      if (mfaAttempted) return;
+      if (!deps.getOtp) throw new PublicError('MFA_REQUIRED');
+      mfaAttempted = true;
+      const code = await deps.getOtp();
+      if (!/^\d{6,8}$/.test(code)) throw new PublicError('MFA_UNAVAILABLE');
+      assertCredentialOrigin(session, page);
+      await input.fill(code, { timeout: deps.timeouts.stepMs });
+      // Some versions submit automatically as soon as the code is complete.
+      session.guard.assertTrusted();
+      if (session.policy.isSchoolOrigin(page.url())) return;
+      assertCredentialOrigin(session, page);
+      try {
+        await page.click(CONTINUE_SELECTOR, { timeout: deps.timeouts.stepMs });
+      } catch (error) {
+        session.guard.assertTrusted();
+        if (!watcher.callbackSeen || !session.policy.isSchoolOrigin(page.url())) throw error;
+      }
+    },
   });
   logEvent('login_completed', { mode: 'password' });
   return token;

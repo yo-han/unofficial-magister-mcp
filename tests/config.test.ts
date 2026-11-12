@@ -46,6 +46,56 @@ const extraHostileSchools = [
 ];
 
 const PACKAGE_ROOT = '/opt/pkg/unofficial-magister-mcp';
+describe('1Password MFA configuration', () => {
+  const env = {
+    MAGISTER_SCHOOL: 'fixture-school',
+    MAGISTER_AUTH_MODE: 'password',
+    MAGISTER_USER: 'synthetic',
+    MAGISTER_PASS: 'synthetic',
+  };
+  it('defers OTP resolution until the challenge', () => {
+    assert.equal(loadConfig(env).otp, undefined);
+    assert.deepEqual(
+      loadConfig({
+        ...env,
+        MAGISTER_1PASSWORD_OTP: 'Private/Magister/Herstel code/one-time password',
+      }).otp,
+      {
+        command: 'op',
+        reference: 'op://Private/Magister/Herstel code/one-time password?attribute=otp',
+      }
+    );
+  });
+  for (const path of [
+    'op://Private/Magister/OTP',
+    'Private/Magister/OTP?attribute=secret',
+    'Private/Magister/OTP\n',
+    'Private/Magister',
+    'Private/Magister/$(secret)',
+  ]) {
+    it(`rejects unsafe or startup-resolved OTP path ${JSON.stringify(path)}`, () => {
+      expectConfigError(
+        () => loadConfig({ ...env, MAGISTER_1PASSWORD_OTP: path }),
+        'MAGISTER_1PASSWORD_OTP'
+      );
+    });
+  }
+  it('requires password mode and an absolute custom CLI path', () => {
+    const config = { ...env, MAGISTER_1PASSWORD_OTP: 'Private/Magister/OTP' };
+    expectConfigError(
+      () => loadConfig({ ...config, MAGISTER_AUTH_MODE: 'interactive' }),
+      'MAGISTER_1PASSWORD_OTP'
+    );
+    expectConfigError(
+      () => loadConfig({ ...config, MAGISTER_1PASSWORD_COMMAND: './op' }),
+      'MAGISTER_1PASSWORD_COMMAND'
+    );
+    assert.equal(
+      loadConfig({ ...config, MAGISTER_1PASSWORD_COMMAND: '/opt/bin/op' }).otp?.command,
+      '/opt/bin/op'
+    );
+  });
+});
 const baseOptions = {
   platform: 'linux' as NodeJS.Platform,
   homedir: '/home/tester',

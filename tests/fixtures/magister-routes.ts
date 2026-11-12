@@ -24,6 +24,12 @@ export interface FixtureOptions {
   children: number[];
   /** auto: the login page fills and submits itself, simulating the user. */
   loginBehaviour: LoginBehaviour;
+  modernButtons: boolean;
+  passkeyChoice: boolean;
+  mfaRequired: boolean;
+  mfaCode: string;
+  mfaOrigin: string;
+  mfaAutoSubmit: boolean;
   /** Origin that hosts the login form (default: the Magister auth origin). */
   loginOrigin: string;
   /** Where the callback page navigates after storing the token. */
@@ -69,6 +75,8 @@ export interface FixtureState {
   options: FixtureOptions;
   /** Valid SSO session cookie values. */
   ssoSessions: Set<string>;
+  pendingMfa: Set<string>;
+  otpPosts: string[];
   /** Valid access tokens. */
   issuedTokens: Set<string>;
   /** Every URL the browser requested. */
@@ -88,6 +96,12 @@ export function createFixtureState(overrides: Partial<FixtureOptions> = {}): Fix
       accountPersonId: PARENT_ID,
       children: [CHILD_A, CHILD_B],
       loginBehaviour: 'auto',
+      modernButtons: false,
+      passkeyChoice: false,
+      mfaRequired: false,
+      mfaCode: '123456',
+      mfaOrigin: AUTH,
+      mfaAutoSubmit: false,
       loginOrigin: AUTH,
       afterCallback: `${FIXTURE_SCHOOL}/magister/#/vandaag`,
       idTokenOnly: false,
@@ -103,6 +117,8 @@ export function createFixtureState(overrides: Partial<FixtureOptions> = {}): Fix
       ...overrides,
     },
     ssoSessions: new Set(),
+    pendingMfa: new Set(),
+    otpPosts: [],
     issuedTokens: new Set(),
     requests: [],
     external: [],
@@ -238,10 +254,13 @@ function loginPage(state: FixtureState, origin: string): string {
          }, 50);`
       : '';
   const popup = popupFromLogin ? `window.open(${JSON.stringify(popupFromLogin)});` : '';
-  return `
+  const markup = `
     <form onsubmit="return false">
       <input id="username" name="username">
       <button id="next" type="button">Doorgaan</button>
+      <div id="password-choice" hidden>
+        <button id="use-password" type="button">Inloggen met wachtwoord</button>
+      </div>
       <div id="step2" hidden>
         <input id="password" type="password" name="password">
         <button id="login" type="button">Inloggen</button>
@@ -250,6 +269,14 @@ function loginPage(state: FixtureState, origin: string): string {
     </form>
     <script>
       document.getElementById('next').onclick = () => {
+        if (${JSON.stringify(state.options.passkeyChoice)}) {
+          document.getElementById('password-choice').hidden = false;
+          return;
+        }
+        document.getElementById('step2').hidden = false;
+      };
+      document.getElementById('use-password').onclick = () => {
+        document.getElementById('password-choice').hidden = true;
         document.getElementById('step2').hidden = false;
       };
       document.getElementById('login').onclick = async () => {
@@ -261,12 +288,15 @@ function loginPage(state: FixtureState, origin: string): string {
             password: document.getElementById('password').value,
           }),
         });
-        if (res.ok) location.replace(${JSON.stringify(authorizeUrl())});
+        if (res.ok) location.replace(${JSON.stringify(state.options.mfaRequired ? `${state.options.mfaOrigin}/account/twofactor` : authorizeUrl())});
         else document.getElementById('error').hidden = false;
       };
       ${popup}
       ${auto}
     </script>`;
+  return state.options.modernButtons
+    ? markup.replaceAll('<button ', '<sl-button ').replaceAll('</button>', '</sl-button>')
+    : markup;
 }
 
 const SCHOOL_APP = `
@@ -354,11 +384,56 @@ async function handleSchool(route: Route, url: URL, state: FixtureState) {
 
 async function handleLoginOrigin(route: Route, url: URL, state: FixtureState, origin: string) {
   const request = route.request();
+  if (url.pathname === '/account/twofactor') {
+    if (request.method() === 'POST') {
+      const code = JSON.parse(request.postData() ?? '{}').code;
+      state.otpPosts.push(code);
+      const pending = cookieValue((await request.allHeaders()).cookie, 'fixture_mfa');
+      if (!pending || !state.pendingMfa.has(pending) || code !== state.options.mfaCode) {
+        return json(route, 401, {});
+      }
+      state.pendingMfa.delete(pending);
+      state.ssoSessions.add(pending);
+      return route.fulfill({
+        status: 200,
+        headers: {
+          'set-cookie': `fixture_sso=${pending}; Path=/; Secure; SameSite=Lax`,
+        },
+        body: '{}',
+      });
+    }
+    return html(
+      route,
+      `<input id="token" autocomplete="one-time-code">
+      <sl-button id="verify">Doorgaan</sl-button>
+      <script>const submit = async () => {
+        const res = await fetch('/account/twofactor', { method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({code: document.getElementById('token').value}) });
+        if (res.ok) location.replace(${JSON.stringify(authorizeUrl())});
+      };
+      document.getElementById('verify').onclick = submit;
+      if (${JSON.stringify(state.options.mfaAutoSubmit)}) {
+        document.getElementById('verify').remove();
+        document.getElementById('token').oninput = submit;
+      }
+      </script>`
+    );
+  }
   if (url.pathname === '/account/login' && request.method() === 'POST') {
     const body = JSON.parse(request.postData() ?? '{}');
     state.loginPosts.push({ origin, username: body.username, password: body.password });
     if (body.username === TEST_USERNAME && body.password === TEST_PASSWORD) {
       const session = `sso-${state.ssoSessions.size + 1}-${Date.now()}`;
+      if (state.options.mfaRequired) {
+        state.pendingMfa.add(session);
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'set-cookie': `fixture_mfa=${session}; Path=/; Secure; SameSite=Lax` },
+          body: '{}',
+        });
+      }
       state.ssoSessions.add(session);
       return route.fulfill({
         status: 200,
@@ -408,7 +483,7 @@ export async function installFixture(context: BrowserContext, state: FixtureStat
     state.requests.push(url.href);
     if (url.origin === FIXTURE_SCHOOL) return handleSchool(route, url, state);
     if (url.origin === AUTH) return handleAuth(route, url, state);
-    if (url.origin === state.options.loginOrigin) {
+    if (url.origin === state.options.loginOrigin || url.origin === state.options.mfaOrigin) {
       return handleLoginOrigin(route, url, state, url.origin);
     }
     state.external.push(url.href);
