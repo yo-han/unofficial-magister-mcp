@@ -46,6 +46,8 @@ export type SafeTag =
   | 'navigation'
   | 'redirect'
   | 'popup'
+  | 'credentials'
+  | 'max_age'
   | 'SIGINT'
   | 'SIGTERM'
   | 'stdin'

@@ -3,10 +3,7 @@ import { CalendarDate, resolveDate } from './dates.js';
 import { PublicError } from './errors.js';
 
 export type ToolName =
-  | 'get_schedule'
-  | 'get_week_schedule'
-  | 'get_dropoff_time'
-  | 'get_pickup_time';
+  'get_schedule' | 'get_week_schedule' | 'get_dropoff_time' | 'get_pickup_time';
 
 export type ToolCall =
   | { name: 'get_schedule'; date: CalendarDate }

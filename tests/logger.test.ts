@@ -112,7 +112,7 @@ describe('secret-safe errors and logs', () => {
 
   it('never surfaces exception text through tool results, stdout, stderr or files', async () => {
     const captured = captureOutput();
-    let toolOutput = '';
+    let toolOutput: string;
     try {
       const server = createServer({
         clientFactory: () => throwingClient,

@@ -17,9 +17,9 @@ export const PUBLIC_ERROR_MESSAGES = {
     'The saved Magister session belongs to a different account. Run `unofficial-magister-mcp logout` and log in again.',
   LOGIN_FAILED: 'The Magister login did not complete.',
   ORIGIN_VIOLATION:
-    'Stopped: the browser was sent to an origin that is not allowed. No credentials were entered or saved.',
+    'Stopped authentication because a browser request targeted an origin that is not allowed.',
   STORAGE_UNSAFE:
-    'The session storage location is not private (wrong owner, type or symlink). Nothing was read or written.',
+    'The session storage location failed its privacy checks (owner, type or symlink).',
   UPSTREAM_UNAVAILABLE: 'Magister could not be reached or returned an error. Try again later.',
   UPSTREAM_INVALID_RESPONSE: 'Magister returned a response in an unexpected format.',
   CHILD_NOT_FOUND: 'The configured MAGISTER_CHILD_ID is not linked to this account.',

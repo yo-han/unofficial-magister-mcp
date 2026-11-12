@@ -137,7 +137,7 @@ function parsePositiveInt(value: string, max: number): number | null {
 
 function isInside(parent: string, child: string): boolean {
   const rel = relative(parent, child);
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  return rel === '' || (rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel));
 }
 
 function defaultStateDir(env: NodeJS.ProcessEnv, options: ConfigOptions): string {

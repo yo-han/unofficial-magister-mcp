@@ -1,502 +1,325 @@
-import { chromium, Browser, BrowserContext, BrowserContextOptions, Page } from 'playwright';
-import { randomUUID } from 'node:crypto';
+import { chromium } from 'playwright';
+import {
+  AcquiredToken,
+  buildSession,
+  captureStorageState,
+  fetchAccountId,
+  Identity,
+  passwordLogin,
+  refreshToken,
+  resolveChild,
+} from './auth.js';
+import { BrowserSession, ClientDeps, DEFAULT_TIMEOUTS } from './browser-session.js';
 import { cacheKey, ScheduleCache } from './cache.js';
-import { Config } from './config.js';
-import { CalendarDate } from './dates.js';
+import type { Config } from './config.js';
+import { amsterdamDateOf, CalendarDate } from './dates.js';
 import { PublicError } from './errors.js';
 import { logEvent } from './logger.js';
+import { Appointment, AppointmentsSchema } from './magister-api.js';
 import { ClassResult, firstClass, lastClass, ScheduleItem } from './schedule.js';
-import { ScheduleClient } from './server.js';
-import { AccountStore, StoredSession } from './storage.js';
+import type { ScheduleClient } from './server.js';
+import type { AccountStore, StoredSession } from './storage.js';
 
+export type { ClientDeps, ClientTimeouts } from './browser-session.js';
+
+/** Refresh a token this long before its `exp`. */
+const EXPIRY_MARGIN_MS = 60_000;
+
+export function defaultClientDeps(config: Config, store: AccountStore | null): ClientDeps {
+  return {
+    config,
+    store,
+    launchBrowser: (headless) => chromium.launch({ headless }),
+    timeouts: DEFAULT_TIMEOUTS,
+  };
+}
+
+interface ActiveSession extends Identity {
+  browser: BrowserSession;
+  token: AcquiredToken;
+  /** Matches session.json; null when persistence is disabled. */
+  sessionId: string | null;
+  /** The stored session this one was built from, for refresh saves. */
+  stored: StoredSession | null;
+}
+
+const timeFormat = new Intl.DateTimeFormat('nl-NL', {
+  hour: '2-digit',
+  minute: '2-digit',
+  timeZone: 'Europe/Amsterdam',
+});
+
+export function toScheduleItem(appt: Appointment): ScheduleItem {
+  return {
+    startTime: timeFormat.format(new Date(appt.Start)),
+    endTime: timeFormat.format(new Date(appt.Einde)),
+    subject: appt.Omschrijving || appt.Vakken?.[0]?.Naam || 'Unknown',
+    teacher: appt.Docenten?.[0]?.Naam ?? undefined,
+    location: appt.Lokalen?.[0]?.Naam || appt.Lokatie || undefined,
+    cancelled: appt.Status === 5 || appt.Uitval === true || appt.Vervallen === true,
+    description: appt.Inhoud ?? undefined,
+  };
+}
+
+/**
+ * Reads schedules for one Magister account.
+ *
+ * Nothing is started until the first call. Without a stored session the call
+ * fails with NOT_LOGGED_IN before a browser exists (except in password mode).
+ * A restored session is checked against /api/account; its token is refreshed
+ * silently at most once per failure. Before every call the client checks that
+ * session.json still holds the same session, so a `logout` from another
+ * process takes effect on the next call.
+ */
 export class MagisterClient implements ScheduleClient {
-  private readonly config: Config;
-  private readonly store: AccountStore | null;
+  private readonly deps: ClientDeps;
   private readonly cache = new ScheduleCache<ScheduleItem[]>();
-  private personId: number | null = null;
-  private sessionId: string = randomUUID();
-  private browser: Browser | null = null;
-  private context: BrowserContext | null = null;
-  private page: Page | null = null;
-  private accessToken: string | null = null;
-  private userId: number | null = null;
+  private ready: Promise<ActiveSession> | null = null;
+  private active: ActiveSession | null = null;
+  private refreshing: Promise<void> | null = null;
+  private closed = false;
 
-  constructor(config: Config, store: AccountStore | null) {
-    this.config = config;
-    this.store = store;
+  constructor(deps: ClientDeps) {
+    this.deps = deps;
   }
 
-  private getBaseUrl(): string {
-    return this.config.schoolOrigin;
+  private get config(): Config {
+    return this.deps.config;
   }
 
-  async init(): Promise<void> {
-    this.browser = await chromium.launch({ headless: true });
-
-    // Try to restore the previous private session
-    const stored = this.store ? await this.store.readSession() : null;
-    const tooOld =
-      stored !== null && Date.now() - Date.parse(stored.savedAt) > this.config.sessionMaxAgeMs;
-    if (stored && !tooOld) {
-      try {
-        this.context = await this.browser.newContext({
-          storageState: stored.storageState as BrowserContextOptions['storageState'],
-        });
-        this.page = await this.context.newPage();
-        this.sessionId = stored.sessionId;
-        this.personId = stored.accountPersonId;
-        this.userId = stored.childId ?? stored.accountPersonId;
-        this.accessToken = stored.accessToken;
-
-        // Verify session is still valid by trying the API
-        await this.page.goto(`${this.getBaseUrl()}/magister/`);
-        await this.page.waitForTimeout(2000);
-
-        // Quick check if we're logged in
-        const url = this.page.url();
-        if (!url.includes('accounts.magister.net') && this.userId) {
-          return; // Session is valid, skip login
-        }
-      } catch {
-        logEvent('session_expired', {}, 'warn');
+  /** One shared initialisation; reset (and the browser closed) when it fails. */
+  private ensureReady(): Promise<ActiveSession> {
+    if (this.closed) return Promise.reject(new PublicError('INTERNAL'));
+    this.ready ??= this.initialize().then(
+      (active) => {
+        this.active = active;
+        return active;
+      },
+      async (error) => {
+        this.ready = null;
+        throw error;
       }
-    }
-
-    // Fresh login required
-    if (this.context) await this.context.close();
-    this.context = await this.browser.newContext();
-    this.page = await this.context.newPage();
-
-    await this.login();
+    );
+    return this.ready;
   }
 
-  private async login(): Promise<void> {
-    if (!this.page || !this.config.username || !this.config.password) {
+  private async initialize(): Promise<ActiveSession> {
+    const store = this.deps.store;
+    const stored = store ? await store.readSession() : null;
+    if (stored === null) {
+      logEvent('session_missing');
+      if (this.config.authMode === 'password') return this.loginWithPassword();
       throw new PublicError('NOT_LOGGED_IN');
     }
-
-    await this.page.goto(this.getBaseUrl());
-
-    // Wait for redirect to accounts.magister.net and username field
-    await this.page.waitForSelector('#username', { timeout: 15000 });
-
-    // Fill username
-    await this.page.fill('#username', this.config.username);
-
-    // Click "Doorgaan" button (DNA-BUTTON web component)
-    // Use text-based selector since it's a custom element
-    await this.page.click(
-      'dna-button:has-text("Doorgaan"), button:has-text("Doorgaan"), [type="submit"]'
-    );
-
-    // Wait for password field to appear (step 2 of login)
-    await this.page.waitForSelector('#password, input[type="password"]', { timeout: 15000 });
-
-    // Fill password
-    await this.page.fill('#password, input[type="password"]', this.config.password);
-
-    // Handle any cookie consent or overlay dialogs
-    try {
-      // Common cookie consent buttons
-      const consentSelectors = [
-        'button:has-text("Accepteren")',
-        'button:has-text("Accept")',
-        'button:has-text("Akkoord")',
-        'button:has-text("OK")',
-        '[id*="cookie"] button',
-        '[class*="cookie"] button',
-        '[class*="consent"] button',
-      ];
-      for (const selector of consentSelectors) {
-        const btn = await this.page.$(selector);
-        if (btn && (await btn.isVisible())) {
-          await btn.click();
-          await this.page.waitForTimeout(500);
-          break;
-        }
-      }
-    } catch {
-      // No consent dialog present.
+    if (Date.now() - Date.parse(stored.savedAt) > this.config.sessionMaxAgeMs) {
+      logEvent('session_expired', { reason: 'max_age' }, 'warn');
+      if (this.config.authMode === 'password') return this.loginWithPassword();
+      throw new PublicError('SESSION_EXPIRED');
     }
-
-    // Set up listener to capture token from redirect URL before clicking
-    const tokenHolder = { value: '' };
-    this.page.on('framenavigated', (frame) => {
-      const url = frame.url();
-      if (
-        url.includes('redirect_callback') ||
-        url.includes('access_token') ||
-        url.includes('id_token')
-      ) {
-        const tokenMatch = url.match(/access_token=([^&]+)/);
-        if (tokenMatch) {
-          tokenHolder.value = decodeURIComponent(tokenMatch[1]);
-        }
-        if (!tokenHolder.value) {
-          const idMatch = url.match(/id_token=([^&]+)/);
-          if (idMatch) {
-            tokenHolder.value = decodeURIComponent(idMatch[1]);
-          }
-        }
-      }
-    });
-
-    // Try multiple selectors for login button
-    const loginSelectors = [
-      'dna-button:has-text("Inloggen")',
-      'button:has-text("Inloggen")',
-      'dna-button[type="submit"]',
-      'button[type="submit"]',
-      'input[type="submit"]',
-      '.btn-primary',
-      '[data-testid="login"]',
-    ];
-
-    let clicked = false;
-    for (const selector of loginSelectors) {
-      try {
-        const btn = await this.page.$(selector);
-        if (btn) {
-          const isVisible = await btn.isVisible();
-          if (isVisible) {
-            await btn.click({ timeout: 5000 });
-            clicked = true;
-            break;
-          }
-        }
-      } catch {
-        // Selector not clickable; try the next one.
-      }
-    }
-
-    if (!clicked) {
-      // Try pressing Enter as last resort
-      await this.page.keyboard.press('Enter');
-    }
-
-    // Wait for navigation away from accounts.magister.net
-    // Just wait for any URL on the school domain
-    try {
-      await this.page.waitForURL(
-        (url) => {
-          return url.origin === this.config.schoolOrigin;
-        },
-        { timeout: 30000 }
-      );
-    } catch {
-      // Continue anyway - we might already be on the right page
-    }
-
-    await this.page.waitForTimeout(3000);
-
-    // Use captured token
-    if (tokenHolder.value) {
-      this.accessToken = tokenHolder.value;
-    } else {
-      // Fallback: try to get token from page storage
-      const token = await this.page.evaluate(() => {
-        // Check various storage locations
-        for (let i = 0; i < sessionStorage.length; i++) {
-          const key = sessionStorage.key(i);
-          if (key) {
-            const val = sessionStorage.getItem(key);
-            if (val && val.startsWith('eyJ') && val.length > 100) {
-              return val;
-            }
-          }
-        }
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          if (key) {
-            const val = localStorage.getItem(key);
-            if (val && val.startsWith('eyJ') && val.length > 100) {
-              return val;
-            }
-          }
-        }
-        return null;
-      });
-      if (token) {
-        this.accessToken = token;
-      }
-    }
-
-    // Make sure we're on the school domain before API calls
-    const currentUrl = this.page.url();
-
-    if (new URL(currentUrl).origin !== this.config.schoolOrigin) {
-      await this.page.goto(`${this.getBaseUrl()}/magister/`);
-      await this.page.waitForTimeout(2000);
-    }
-
-    // Fetch user ID
-    await this.fetchUserId();
-
-    // Save auth state to disk for next time
-    await this.saveAuthState();
+    return this.restore(stored);
   }
 
-  private async saveAuthState(): Promise<void> {
-    if (!this.context || !this.store || !this.config.persistSession) return;
-    if (!this.personId || !this.accessToken) return;
+  private async withBrowser<T>(browser: BrowserSession, work: () => Promise<T>): Promise<T> {
     try {
-      const storageState = await this.context.storageState();
-      const session: StoredSession = {
-        version: 1,
-        schoolOrigin: this.config.schoolOrigin,
-        profileHash: this.store.profileHash,
-        accountPersonId: this.personId,
-        childId: this.userId ?? undefined,
-        sessionId: this.sessionId,
-        savedAt: new Date().toISOString(),
-        accessToken: this.accessToken,
-        accessTokenExp: null,
-        storageState: storageState as unknown as StoredSession['storageState'],
-      };
-      await this.store.writeSession(session);
-      logEvent('session_saved');
-    } catch {
-      logEvent('session_save_skipped', {}, 'warn');
+      return await work();
+    } catch (error) {
+      await browser.close();
+      throw error;
     }
   }
 
-  private async fetchUserId(): Promise<void> {
-    if (!this.page) return;
-
-    try {
-      const token = this.accessToken;
-      const response = await this.page.evaluate(async (t) => {
-        const headers: Record<string, string> = {
-          Accept: 'application/json',
-        };
-        if (t) {
-          headers['Authorization'] = `Bearer ${t}`;
-        }
-
-        const res = await fetch('/api/account', {
-          credentials: 'include',
-          headers,
-        });
-        if (!res.ok) return { error: res.status, statusText: res.statusText };
-        return await res.json();
-      }, token);
-
-      // Check if this is a parent account with linked children
-      if (response.Persoon?.Id) {
-        const personId = response.Persoon.Id;
-        this.personId = personId;
-
-        // Try to get linked children (for parent accounts)
-        const childrenResponse = await this.page.evaluate(
-          async (params) => {
-            const { personId, token } = params;
-            const headers: Record<string, string> = {
-              Accept: 'application/json',
-            };
-            if (token) {
-              headers['Authorization'] = `Bearer ${token}`;
-            }
-
-            // Try different endpoints for getting children
-            const endpoints = [
-              `/api/personen/${personId}/kinderen`,
-              `/api/leerlingen`,
-              `/api/accounts/${personId}/kinderen`,
-            ];
-
-            for (const endpoint of endpoints) {
-              try {
-                const res = await fetch(endpoint, { credentials: 'include', headers });
-                if (res.ok) {
-                  const data = await res.json();
-                  return { endpoint, data };
-                }
-              } catch {
-                // Continue to next endpoint
-              }
-            }
-            return { error: 'No children endpoint found' };
-          },
-          { personId, token }
+  private async loginWithPassword(): Promise<ActiveSession> {
+    const browser = await BrowserSession.open(this.deps, true);
+    return this.withBrowser(browser, async () => {
+      const token = await passwordLogin(browser, this.deps);
+      const accountPersonId = await fetchAccountId(browser, token.accessToken);
+      const childId = await resolveChild(browser, this.config, token.accessToken, accountPersonId);
+      let stored: StoredSession | null = null;
+      if (this.deps.store) {
+        stored = buildSession(
+          this.deps,
+          { accountPersonId, childId },
+          token,
+          await captureStorageState(browser)
         );
-
-        // Parse children response
-        const children = childrenResponse.data?.Items || childrenResponse.data || [];
-        if (Array.isArray(children) && children.length > 0) {
-          // Use the first child's ID
-          const child = children[0];
-          this.userId = child.Id || child.Persoon?.Id || child.LeerlingId;
-        } else {
-          // No children found, use the logged-in person's ID (might be a student account)
-          this.userId = personId;
-        }
+        browser.guard.assertTrusted();
+        await this.deps.store.writeSession(stored);
+        logEvent('session_saved');
       }
-    } catch {
-      logEvent('api_error', { endpoint: 'account' }, 'warn');
-    }
-  }
-
-  async getSchedule(dateStr: CalendarDate): Promise<ScheduleItem[]> {
-    // Check cache first (SWR pattern)
-    const cached = this.userId && this.personId ? this.cache.get(this.cacheKeyFor(dateStr)) : null;
-    if (cached) {
-      if (cached.fresh) {
-        return cached.value;
-      }
-      // Return stale data immediately, but trigger refresh in background
-      this.refreshScheduleInBackground(dateStr);
-      return cached.value;
-    }
-
-    return this.fetchScheduleFromAPI(dateStr);
-  }
-
-  private refreshScheduleInBackground(dateStr: CalendarDate): void {
-    // Don't await - let it run in background
-    this.fetchScheduleFromAPI(dateStr).catch(() => {
-      logEvent('cache_refresh_failed', {}, 'warn');
+      return {
+        browser,
+        token,
+        accountPersonId,
+        childId,
+        sessionId: stored?.sessionId ?? null,
+        stored,
+      };
     });
   }
 
-  private cacheKeyFor(date: CalendarDate): string {
-    return cacheKey(this.personId ?? 0, this.userId ?? 0, date);
+  private async restore(stored: StoredSession): Promise<ActiveSession> {
+    const browser = await BrowserSession.open(this.deps, true, stored.storageState);
+    return this.withBrowser(browser, async () => {
+      const active: ActiveSession = {
+        browser,
+        token: { accessToken: stored.accessToken, accessTokenExp: stored.accessTokenExp },
+        accountPersonId: stored.accountPersonId,
+        childId: stored.childId,
+        sessionId: stored.sessionId,
+        stored,
+      };
+      if (isExpired(active.token)) await this.refresh(active);
+
+      let accountPersonId: number;
+      try {
+        accountPersonId = await fetchAccountId(browser, active.token.accessToken);
+      } catch (error) {
+        if (!(error instanceof PublicError) || error.code !== 'SESSION_EXPIRED') throw error;
+        await this.refresh(active);
+        accountPersonId = await fetchAccountId(browser, active.token.accessToken);
+      }
+      if (accountPersonId !== stored.accountPersonId) throw new PublicError('SESSION_MISMATCH');
+
+      if (this.config.childId !== undefined && this.config.childId !== stored.childId) {
+        active.childId = await resolveChild(
+          browser,
+          this.config,
+          active.token.accessToken,
+          accountPersonId
+        );
+      }
+      logEvent('session_restored');
+      return active;
+    });
   }
 
-  private async fetchScheduleFromAPI(dateStr: CalendarDate): Promise<ScheduleItem[]> {
-    if (!this.page) throw new PublicError('INTERNAL');
-    const generation = this.cache.generation;
+  /** Gets a new token and saves it, unless the session was logged out meanwhile. */
+  private async refresh(active: ActiveSession): Promise<void> {
+    const token = await refreshToken(active.browser, this.deps);
+    active.browser.guard.assertTrusted();
+    const accountPersonId = await fetchAccountId(active.browser, token.accessToken);
+    if (accountPersonId !== active.accountPersonId) throw new PublicError('SESSION_MISMATCH');
+    if (this.deps.store && active.stored && active.sessionId) {
+      const updated: StoredSession = {
+        ...active.stored,
+        accessToken: token.accessToken,
+        accessTokenExp: token.accessTokenExp,
+        storageState: await captureStorageState(active.browser),
+      };
+      if (!(await this.deps.store.replaceSession(updated, active.sessionId))) {
+        throw new PublicError('NOT_LOGGED_IN');
+      }
+      active.stored = updated;
+    }
+    active.token = token;
+  }
 
-    // Try to get userId if we don't have it
-    if (!this.userId) {
-      await this.fetchUserId();
-      if (!this.userId) {
-        throw new PublicError('UPSTREAM_UNAVAILABLE');
+  private refreshShared(active: ActiveSession): Promise<void> {
+    this.refreshing ??= this.refresh(active).finally(() => {
+      this.refreshing = null;
+    });
+    return this.refreshing;
+  }
+
+  /** Closes the browser and forgets everything; the next call starts over. */
+  private async reset(): Promise<void> {
+    const active = this.active;
+    this.active = null;
+    this.ready = null;
+    this.cache.clear();
+    if (active) await active.browser.close();
+  }
+
+  /** A ready session that still matches session.json. */
+  private async session(): Promise<ActiveSession> {
+    const active = await this.ensureReady();
+    if (this.deps.store && active.sessionId !== null) {
+      let current: string | null;
+      try {
+        current = await this.deps.store.currentSessionId();
+      } catch (error) {
+        await this.reset();
+        throw error;
+      }
+      if (current !== active.sessionId) {
+        logEvent('session_removed', {}, 'warn');
+        await this.reset();
+        throw new PublicError('NOT_LOGGED_IN');
       }
     }
+    if (active.browser.guard.broken) {
+      await this.reset();
+      throw new PublicError('ORIGIN_VIOLATION');
+    }
+    return active;
+  }
 
-    // Make API call with cookies (and token if available)
-    const apiResult = await this.page.evaluate(
-      async (params) => {
-        const { dateStr, userId, token } = params;
+  /** Runs an API call, refreshing the token once on expiry or a 401. */
+  private async withToken<T>(
+    active: ActiveSession,
+    call: (token: string) => Promise<T>
+  ): Promise<T> {
+    if (isExpired(active.token)) await this.refreshShared(active);
+    try {
+      return await call(active.token.accessToken);
+    } catch (error) {
+      if (!(error instanceof PublicError) || error.code !== 'SESSION_EXPIRED') throw error;
+      await this.refreshShared(active);
+      return call(active.token.accessToken);
+    }
+  }
 
-        try {
-          const scheduleUrl = `/api/personen/${userId}/afspraken?status=1&van=${dateStr}&tot=${dateStr}`;
+  private personFor(active: ActiveSession): number {
+    return active.childId ?? active.accountPersonId;
+  }
 
-          const headers: Record<string, string> = {
-            Accept: 'application/json',
-          };
-          if (token) {
-            headers['Authorization'] = `Bearer ${token}`;
-          }
+  private keyFor(active: ActiveSession, date: CalendarDate): string {
+    return cacheKey(active.accountPersonId, this.personFor(active), date);
+  }
 
-          const res = await fetch(scheduleUrl, {
-            credentials: 'include',
-            headers,
-          });
-
-          if (!res.ok) {
-            return { error: 'Failed to get schedule', status: res.status, url: scheduleUrl };
-          }
-
-          const schedule = await res.json();
-          return { success: true, schedule };
-        } catch (e) {
-          return { error: String(e) };
-        }
-      },
-      { dateStr, userId: this.userId, token: this.accessToken || '' }
+  /** Fetches [from, to] in one call and caches every date in the range. */
+  private async fetchRange(
+    active: ActiveSession,
+    dates: CalendarDate[]
+  ): Promise<Record<CalendarDate, ScheduleItem[]>> {
+    const generation = this.cache.generation;
+    const from = dates[0];
+    const to = dates[dates.length - 1];
+    const person = this.personFor(active);
+    const path = `/api/personen/${person}/afspraken?status=1&van=${from}&tot=${to}`;
+    const appointments = await this.withToken(active, (token) =>
+      active.browser.api.get('schedule', path, AppointmentsSchema, token)
     );
 
-    if (apiResult.error) {
-      logEvent('api_error', { endpoint: 'schedule' }, 'warn');
-      return this.getScheduleFromDOM();
-    }
-
-    // Parse API response into ScheduleItems
-    const items: ScheduleItem[] = [];
-    const appointments = apiResult.schedule?.Items || apiResult.schedule || [];
-
+    const byDate: Record<CalendarDate, ScheduleItem[]> = {};
+    for (const date of dates) byDate[date] = [];
     for (const appt of appointments) {
-      items.push({
-        startTime: appt.Start
-          ? new Date(appt.Start).toLocaleTimeString('nl-NL', {
-              hour: '2-digit',
-              minute: '2-digit',
-              timeZone: 'Europe/Amsterdam',
-            })
-          : '',
-        endTime: appt.Einde
-          ? new Date(appt.Einde).toLocaleTimeString('nl-NL', {
-              hour: '2-digit',
-              minute: '2-digit',
-              timeZone: 'Europe/Amsterdam',
-            })
-          : '',
-        subject: appt.Omschrijving || appt.Vakken?.[0]?.Naam || 'Unknown',
-        teacher: appt.Docenten?.[0]?.Naam,
-        location: appt.Lokalen?.[0]?.Naam || appt.Lokatie,
-        cancelled: appt.Status === 5 || appt.Uitval || appt.Vervallen || false,
-        description: appt.Inhoud,
-      });
+      const date = amsterdamDateOf(appt.Start);
+      byDate[date]?.push(toScheduleItem(appt));
     }
-
-    // Cache the result
-    this.cache.set(this.cacheKeyFor(dateStr), items, generation);
-
-    return items;
+    for (const date of dates) this.cache.set(this.keyFor(active, date), byDate[date], generation);
+    return byDate;
   }
 
-  private async getScheduleFromDOM(): Promise<ScheduleItem[]> {
-    if (!this.page) return [];
-
-    // Navigate to agenda page
-    await this.page.goto(`${this.getBaseUrl()}/magister/#/agenda`);
-    await this.page.waitForTimeout(3000);
-
-    // Extract schedule items from DOM
-    const items = await this.page.evaluate(() => {
-      const results: ScheduleItem[] = [];
-
-      // Try various selectors
-      const selectors = [
-        '.agenda-item',
-        '.appointment',
-        '[class*="appointment"]',
-        '[class*="agenda-list"] > *',
-        '.rooster-item',
-      ];
-
-      for (const selector of selectors) {
-        const elements = document.querySelectorAll(selector);
-        if (elements.length > 0) {
-          elements.forEach((el) => {
-            const text = el.textContent?.trim() || '';
-            if (text.length > 0) {
-              results.push({
-                startTime: '',
-                endTime: '',
-                subject: text.slice(0, 100),
-                cancelled: el.classList.contains('cancelled') || el.classList.contains('vervallen'),
-                description: undefined,
-              });
-            }
-          });
-          break;
-        }
-      }
-
-      return results;
-    });
-
-    return items;
+  private refreshInBackground(active: ActiveSession, dates: CalendarDate[]): void {
+    this.fetchRange(active, dates).catch(() => logEvent('cache_refresh_failed', {}, 'warn'));
   }
 
+  async getSchedule(date: CalendarDate): Promise<ScheduleItem[]> {
+    return (await this.getWeekSchedule([date]))[date];
+  }
+
+  /** Schedules for consecutive dates, with one API call when anything is missing. */
   async getWeekSchedule(dates: CalendarDate[]): Promise<Record<CalendarDate, ScheduleItem[]>> {
-    const result: Record<CalendarDate, ScheduleItem[]> = {};
-    for (const date of dates) {
-      result[date] = await this.getSchedule(date);
+    if (dates.length === 0) return {};
+    const active = await this.session();
+    const hits = dates.map((date) => this.cache.get(this.keyFor(active, date)));
+    if (hits.every((hit) => hit !== null)) {
+      logEvent('cache_hit', { days: dates.length });
+      if (hits.some((hit) => !hit?.fresh)) this.refreshInBackground(active, dates);
+      return Object.fromEntries(dates.map((date, index) => [date, hits[index]!.value]));
     }
-    return result;
+    return this.fetchRange(active, dates);
   }
 
   async getFirstClass(date: CalendarDate): Promise<ClassResult> {
@@ -507,12 +330,17 @@ export class MagisterClient implements ScheduleClient {
     return lastClass(await this.getSchedule(date));
   }
 
+  /** Idempotent; waits for a pending start so no browser is left behind. */
   async close(): Promise<void> {
-    if (this.browser) {
-      await this.browser.close();
-      this.browser = null;
-      this.context = null;
-      this.page = null;
-    }
+    this.closed = true;
+    const pending = this.ready;
+    if (pending) await pending.catch(() => undefined);
+    await this.reset();
   }
+}
+
+function isExpired(token: AcquiredToken): boolean {
+  return (
+    token.accessTokenExp !== null && token.accessTokenExp * 1000 - EXPIRY_MARGIN_MS <= Date.now()
+  );
 }

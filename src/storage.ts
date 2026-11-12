@@ -24,6 +24,7 @@ const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const IS_POSIX = process.platform !== 'win32';
 const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+const O_NONBLOCK = constants.O_NONBLOCK ?? 0;
 const O_DIRECTORY = constants.O_DIRECTORY ?? 0;
 
 const StorageStateSchema = z.object({
@@ -147,7 +148,7 @@ export class AccountStore {
 
     let handle: FileHandle;
     try {
-      handle = await open(this.sessionPath, constants.O_RDONLY | O_NOFOLLOW);
+      handle = await open(this.sessionPath, constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     } catch (error) {
       if (errorCode(error) === 'ENOENT') return null;
       throw unsafe();
@@ -231,6 +232,7 @@ export class AccountStore {
    * followed. Returns false if there was nothing to remove.
    */
   async deleteAccount(): Promise<boolean> {
+    if (!(await checkExistingDir(this.stateDir))) return false;
     let info;
     try {
       info = await lstat(this.accountDir);
@@ -242,6 +244,7 @@ export class AccountStore {
       await unlink(this.accountDir);
       return true;
     }
+    if (!(await checkExistingDir(this.accountDir))) return false;
     for (const name of await readdir(this.accountDir)) {
       if (name === SESSION_FILE || TMP_FILE.test(name)) {
         await unlink(join(this.accountDir, name));

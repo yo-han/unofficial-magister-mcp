@@ -9,58 +9,53 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Development (runs with tsx, hot-reload friendly)
-npm run dev
+npm run dev          # Run from source with tsx
+npm run build        # Build with tsup (ESM + types)
+npm start            # Run compiled server
+node dist/index.js login   # Interactive login (visible Chromium), stores the session
+node dist/index.js logout  # Remove the local session
 
-# Build with tsup (ESM + types)
-npm run build
-
-# Run compiled server
-npm start
-
-# Linting and formatting
-npm run lint        # Check for issues
-npm run lint:fix    # Auto-fix issues
-npm run format      # Format with Prettier
-npm run type-check  # TypeScript type checking
+npm test             # All tests (unit, synthetic Chromium, protocol); needs `npm run build` first
+npm run test:unit    # Unit tests only (no browser)
+npm run smoke        # Protocol smoke test against dist/ (no credentials, no network)
+npm run lint         # ESLint (src, tests, scripts)
+npm run format:check # Prettier
+npm run type-check   # tsc for src and tests
 ```
+
+Browser tests need Chromium: `npx playwright install chromium`.
 
 ## Architecture
 
-### MCP Server (`src/index.ts`)
-- Entry point, stdio transport server using `@modelcontextprotocol/sdk`
-- Exposes 4 tools: `get_schedule`, `get_week_schedule`, `get_dropoff_time`, `get_pickup_time`
-- Date parsing supports: "today", "tomorrow", weekday names, YYYY-MM-DD
-- Lazy-initializes MagisterClient on first tool call
-- Logs to `/tmp/magister-mcp.log` and stderr
+- `src/index.ts` – entry: loads `.env` from the cwd, calls `run()` in `cli.ts`
+- `src/cli.ts` – commands (`login`, `logout`, `--help`, `--version`, none = stdio server) and shutdown on SIGINT/SIGTERM/stdin close
+- `src/server.ts` – MCP server (lowlevel `Server`), the 4 tools, output formatting
+- `src/tools.ts` / `src/dates.ts` – tool definitions, argument validation, Europe/Amsterdam dates
+- `src/config.ts` – env validation; canonical school origin; state dir
+- `src/security.ts` / `src/browser-policy.ts` – exact-origin allowlist; context-wide navigation, redirect and popup guard
+- `src/browser-session.ts` – one browser/context/page with the policy applied
+- `src/auth.ts` – interactive and password login, silent refresh, token capture from the school callback only, child selection
+- `src/magister-api.ts` – API boundary: exact origin, no redirects, zod schemas
+- `src/magister.ts` – `MagisterClient`: restore, refresh, logout detection, schedule mapping
+- `src/storage.ts` – private per-account `session.json` (0700/0600, O_NOFOLLOW, atomic writes)
+- `src/cache.ts` – in-memory schedule cache per client (TTL, max stale, LRU, generation)
+- `src/logger.ts` / `src/errors.ts` – fixed log events on stderr; public errors with fixed codes and texts
 
-### Magister Client (`src/magister.ts`)
-- `MagisterClient` class handles all Magister.net interaction
-- **Authentication flow**: Saves browser session to `.auth-state.json`, restores on next run to avoid re-login
-- **Schedule caching**: 5-minute TTL with SWR pattern - returns stale data immediately while refreshing in background
-- **Parent account support**: Detects parent accounts and uses first child's ID for schedule queries
-- **API fallback**: If API fails (status 5xx or auth issues), falls back to DOM scraping
+### Rules that must hold
+
+- stdout carries only JSON-RPC; everything else goes through `logEvent` to stderr. Never log free text, URLs, error messages, tokens or names.
+- Errors reaching the client are `PublicError` codes; anything else becomes `INTERNAL`.
+- Credentials are only filled on `https://accounts.magister.net`; tokens only come from the callback on the school origin; never use an `id_token`.
+- API errors are errors, never an empty schedule.
+- Tests never touch real Magister, real credentials or the real state dir; the fixture in `tests/fixtures/magister-routes.ts` aborts everything else.
 
 ### Key Implementation Details
-- Uses Playwright in headless mode
-- Auth tokens captured from OAuth redirect URL or browser storage
-- Schedule API endpoint: `/api/personen/{userId}/afspraken?status=1&van={date}&tot={date}`
-- Cached data stored in `.schedule-cache.json`
-
-## File Structure
-
-```
-src/
-├── index.ts      # MCP server entry point, tool handlers
-└── magister.ts   # Magister client (auth, API, caching)
-```
+- Schedule API endpoint: `/api/personen/{id}/afspraken?status=1&van={date}&tot={date}`; the week is one call
+- API calls run as `fetch()` inside the page (Playwright's `context.request` bypasses `context.route`)
 
 ## Environment Variables
 
-Required in `.env` (see `.env.example`):
-- `MAGISTER_SCHOOL` - e.g., `schoolname.magister.net`
-- `MAGISTER_USER` - username
-- `MAGISTER_PASS` - password
+See `.env.example` and the README. Only `MAGISTER_SCHOOL` is required; `MAGISTER_USER`/`MAGISTER_PASS` only in `MAGISTER_AUTH_MODE=password`.
 
 ## Build System
 
