@@ -1,124 +1,52 @@
-import { chromium, Browser, BrowserContext, Page } from 'playwright';
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { chromium, Browser, BrowserContext, BrowserContextOptions, Page } from 'playwright';
+import { randomUUID } from 'node:crypto';
+import { cacheKey, ScheduleCache } from './cache.js';
+import { Config } from './config.js';
 import { CalendarDate } from './dates.js';
 import { PublicError } from './errors.js';
 import { logEvent } from './logger.js';
 import { ClassResult, firstClass, lastClass, ScheduleItem } from './schedule.js';
 import { ScheduleClient } from './server.js';
-import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const AUTH_STATE_PATH = join(__dirname, '..', '.auth-state.json');
-const CACHE_PATH = join(__dirname, '..', '.schedule-cache.json');
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-// Simple cache structure
-interface CacheEntry {
-  data: ScheduleItem[];
-  timestamp: number;
-}
-interface CacheStore {
-  [dateKey: string]: CacheEntry;
-}
-
-// Extended storage state with custom Magister data
-interface MagisterStorageState {
-  _magister?: {
-    userId: number | null;
-    accessToken: string | null;
-    savedAt: string;
-  };
-  [key: string]: unknown;
-}
-
-// Cache helper
-class ScheduleCache {
-  private cache: CacheStore = {};
-
-  constructor() {
-    this.load();
-  }
-
-  private load() {
-    try {
-      if (existsSync(CACHE_PATH)) {
-        this.cache = JSON.parse(readFileSync(CACHE_PATH, 'utf-8'));
-      }
-    } catch {
-      this.cache = {};
-    }
-  }
-
-  private save() {
-    try {
-      writeFileSync(CACHE_PATH, JSON.stringify(this.cache, null, 2));
-    } catch {
-      // Ignore save errors
-    }
-  }
-
-  get(dateKey: string): { data: ScheduleItem[]; isStale: boolean } | null {
-    const entry = this.cache[dateKey];
-    if (!entry) return null;
-
-    const age = Date.now() - entry.timestamp;
-    const isStale = age > CACHE_TTL_MS;
-
-    return { data: entry.data, isStale };
-  }
-
-  set(dateKey: string, data: ScheduleItem[]) {
-    this.cache[dateKey] = { data, timestamp: Date.now() };
-    this.save();
-  }
-
-  clear() {
-    this.cache = {};
-    this.save();
-  }
-}
-
-const scheduleCache = new ScheduleCache();
-
-export interface MagisterConfig {
-  school: string;
-  username: string;
-  password: string;
-}
+import { AccountStore, StoredSession } from './storage.js';
 
 export class MagisterClient implements ScheduleClient {
-  private config: MagisterConfig;
+  private readonly config: Config;
+  private readonly store: AccountStore | null;
+  private readonly cache = new ScheduleCache<ScheduleItem[]>();
+  private personId: number | null = null;
+  private sessionId: string = randomUUID();
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private accessToken: string | null = null;
   private userId: number | null = null;
 
-  constructor(config: MagisterConfig) {
+  constructor(config: Config, store: AccountStore | null) {
     this.config = config;
+    this.store = store;
   }
 
   private getBaseUrl(): string {
-    const school = this.config.school.replace(/\.magister\.net$/, '');
-    return `https://${school}.magister.net`;
+    return this.config.schoolOrigin;
   }
 
   async init(): Promise<void> {
     this.browser = await chromium.launch({ headless: true });
 
-    // Try to restore previous session from disk
-    if (existsSync(AUTH_STATE_PATH)) {
+    // Try to restore the previous private session
+    const stored = this.store ? await this.store.readSession() : null;
+    const tooOld =
+      stored !== null && Date.now() - Date.parse(stored.savedAt) > this.config.sessionMaxAgeMs;
+    if (stored && !tooOld) {
       try {
-        const storageState = JSON.parse(readFileSync(AUTH_STATE_PATH, 'utf-8'));
-        this.context = await this.browser.newContext({ storageState });
+        this.context = await this.browser.newContext({
+          storageState: stored.storageState as BrowserContextOptions['storageState'],
+        });
         this.page = await this.context.newPage();
-
-        // Restore saved userId and token
-        if (storageState._magister) {
-          this.userId = storageState._magister.userId;
-          this.accessToken = storageState._magister.accessToken;
-        }
+        this.sessionId = stored.sessionId;
+        this.personId = stored.accountPersonId;
+        this.userId = stored.childId ?? stored.accountPersonId;
+        this.accessToken = stored.accessToken;
 
         // Verify session is still valid by trying the API
         await this.page.goto(`${this.getBaseUrl()}/magister/`);
@@ -143,7 +71,9 @@ export class MagisterClient implements ScheduleClient {
   }
 
   private async login(): Promise<void> {
-    if (!this.page) throw new PublicError('INTERNAL');
+    if (!this.page || !this.config.username || !this.config.password) {
+      throw new PublicError('NOT_LOGGED_IN');
+    }
 
     await this.page.goto(this.getBaseUrl());
 
@@ -246,14 +176,10 @@ export class MagisterClient implements ScheduleClient {
 
     // Wait for navigation away from accounts.magister.net
     // Just wait for any URL on the school domain
-    const schoolDomain = this.config.school.replace(/\.magister\.net$/, '') + '.magister.net';
-
     try {
       await this.page.waitForURL(
         (url) => {
-          const matches =
-            url.href.includes(schoolDomain) && !url.href.includes('accounts.magister.net');
-          return matches;
+          return url.origin === this.config.schoolOrigin;
         },
         { timeout: 30000 }
       );
@@ -298,7 +224,7 @@ export class MagisterClient implements ScheduleClient {
     // Make sure we're on the school domain before API calls
     const currentUrl = this.page.url();
 
-    if (!currentUrl.includes(this.config.school.replace(/\.magister\.net$/, ''))) {
+    if (new URL(currentUrl).origin !== this.config.schoolOrigin) {
       await this.page.goto(`${this.getBaseUrl()}/magister/`);
       await this.page.waitForTimeout(2000);
     }
@@ -311,19 +237,23 @@ export class MagisterClient implements ScheduleClient {
   }
 
   private async saveAuthState(): Promise<void> {
-    if (!this.context) return;
+    if (!this.context || !this.store || !this.config.persistSession) return;
+    if (!this.personId || !this.accessToken) return;
     try {
       const storageState = await this.context.storageState();
-      // Add our custom data to the storage state
-      const extendedState: MagisterStorageState = {
-        ...storageState,
-        _magister: {
-          userId: this.userId,
-          accessToken: this.accessToken,
-          savedAt: new Date().toISOString(),
-        },
+      const session: StoredSession = {
+        version: 1,
+        schoolOrigin: this.config.schoolOrigin,
+        profileHash: this.store.profileHash,
+        accountPersonId: this.personId,
+        childId: this.userId ?? undefined,
+        sessionId: this.sessionId,
+        savedAt: new Date().toISOString(),
+        accessToken: this.accessToken,
+        accessTokenExp: null,
+        storageState: storageState as unknown as StoredSession['storageState'],
       };
-      writeFileSync(AUTH_STATE_PATH, JSON.stringify(extendedState, null, 2));
+      await this.store.writeSession(session);
       logEvent('session_saved');
     } catch {
       logEvent('session_save_skipped', {}, 'warn');
@@ -354,6 +284,7 @@ export class MagisterClient implements ScheduleClient {
       // Check if this is a parent account with linked children
       if (response.Persoon?.Id) {
         const personId = response.Persoon.Id;
+        this.personId = personId;
 
         // Try to get linked children (for parent accounts)
         const childrenResponse = await this.page.evaluate(
@@ -407,14 +338,14 @@ export class MagisterClient implements ScheduleClient {
 
   async getSchedule(dateStr: CalendarDate): Promise<ScheduleItem[]> {
     // Check cache first (SWR pattern)
-    const cached = scheduleCache.get(dateStr);
+    const cached = this.userId && this.personId ? this.cache.get(this.cacheKeyFor(dateStr)) : null;
     if (cached) {
-      if (!cached.isStale) {
-        return cached.data;
+      if (cached.fresh) {
+        return cached.value;
       }
       // Return stale data immediately, but trigger refresh in background
       this.refreshScheduleInBackground(dateStr);
-      return cached.data;
+      return cached.value;
     }
 
     return this.fetchScheduleFromAPI(dateStr);
@@ -427,8 +358,13 @@ export class MagisterClient implements ScheduleClient {
     });
   }
 
+  private cacheKeyFor(date: CalendarDate): string {
+    return cacheKey(this.personId ?? 0, this.userId ?? 0, date);
+  }
+
   private async fetchScheduleFromAPI(dateStr: CalendarDate): Promise<ScheduleItem[]> {
     if (!this.page) throw new PublicError('INTERNAL');
+    const generation = this.cache.generation;
 
     // Try to get userId if we don't have it
     if (!this.userId) {
@@ -505,7 +441,7 @@ export class MagisterClient implements ScheduleClient {
     }
 
     // Cache the result
-    scheduleCache.set(dateStr, items);
+    this.cache.set(this.cacheKeyFor(dateStr), items, generation);
 
     return items;
   }
