@@ -124,15 +124,16 @@ logins. It never saves the code or OTP seed. Code entry is restricted to the exa
 Magister authentication origin. A missing configuration returns `[MFA_REQUIRED]`;
 an unavailable CLI, locked vault or invalid code format returns `[MFA_UNAVAILABLE]`.
 
-Use `op run` to supply credentials without putting their values in your MCP
-configuration. For example, in Claude Desktop/Claude Code:
+Use `op://` references directly to supply credentials without putting their values
+in your MCP configuration. Start Node directly, without an `op run` wrapper, so
+startup and tool discovery do not unlock 1Password. For example, in Claude Desktop/Claude Code:
 
 ```json
 {
   "mcpServers": {
     "magister": {
-      "command": "/opt/homebrew/bin/op",
-      "args": ["--account", "example.1password.com", "run", "--", "/absolute/path/to/node", "/absolute/path/to/unofficial-magister-mcp/dist/index.js"],
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/unofficial-magister-mcp/dist/index.js"],
       "env": {
         "MAGISTER_SCHOOL": "schoolname",
         "MAGISTER_PROFILE": "default",
@@ -156,8 +157,9 @@ startup, instead of fetching a current code when Magister requests it.
 
 Enable the 1Password desktop app's CLI integration. 1Password may still require
 unlocking or authorization; the server does not bypass that protection. Username
-and password are loaded into process memory at startup, so restart the MCP after
-changing them. For Codex, use the same command, arguments and environment under
+and password references are resolved only when Magister displays a login form;
+valid stored sessions and SSO refreshes do not read them. A failed credential read
+returns `[CREDENTIALS_UNAVAILABLE]` without exposing CLI output. For Codex, use the same command, arguments and environment under
 `mcp_servers.magister` in its TOML configuration; a 120-second tool timeout allows
 time for login. Interactive login remains available when you prefer to sign in
 yourself.

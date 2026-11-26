@@ -16,6 +16,8 @@ export const PUBLIC_ERROR_MESSAGES = {
   SESSION_MISMATCH:
     'The saved Magister session belongs to a different account. Run `unofficial-magister-mcp logout` and log in again.',
   LOGIN_FAILED: 'The Magister login did not complete.',
+  CREDENTIALS_UNAVAILABLE:
+    '1Password could not provide login credentials. Unlock 1Password and allow CLI access, then retry.',
   MFA_REQUIRED:
     'Magister requires a verification code. Configure MAGISTER_1PASSWORD_OTP for automatic verification.',
   MFA_UNAVAILABLE:
