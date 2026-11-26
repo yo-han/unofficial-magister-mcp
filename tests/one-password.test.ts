@@ -3,8 +3,75 @@ import { mkdtemp, writeFile, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { it } from 'node:test';
-import { readOnePasswordOtp } from '../src/one-password.js';
+import { readOnePasswordOtp, resolveLoginCredentials } from '../src/one-password.js';
+import { loadConfig } from '../src/config.js';
 import { PublicError } from '../src/errors.js';
+
+it('resolves credentials on demand, preserves whitespace and sanitizes CLI failures', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'magister-login-op-'));
+  const command = join(dir, 'op');
+  const capture = join(dir, 'calls.jsonl');
+  try {
+    await writeFile(
+      command,
+      `#!${process.execPath}
+const fs = require('node:fs');
+fs.appendFileSync(${JSON.stringify(capture)}, JSON.stringify({ args: process.argv.slice(2), user: process.env.MAGISTER_USER, pass: process.env.MAGISTER_PASS }) + '\\n');
+process.stdout.write(process.argv.at(-1).endsWith('/username') ? 'synthetic-user' : '  synthetic-password \\n');
+`,
+      { mode: 0o700 }
+    );
+    const env = {
+      MAGISTER_SCHOOL: 'fixture-school',
+      MAGISTER_AUTH_MODE: 'password',
+      MAGISTER_USER: 'op://Private/Magister/username',
+      MAGISTER_PASS: 'op://Private/Magister/password',
+      MAGISTER_1PASSWORD_COMMAND: command,
+      MAGISTER_1PASSWORD_ACCOUNT: 'example.1password.com',
+    };
+    const config = loadConfig(env);
+    await assert.rejects(readFile(capture), { code: 'ENOENT' });
+    assert.deepEqual(await resolveLoginCredentials(config), {
+      username: 'synthetic-user',
+      password: '  synthetic-password \n',
+    });
+    const calls = (await readFile(capture, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(
+      calls,
+      [env.MAGISTER_USER, env.MAGISTER_PASS].map((ref) => ({
+        args: ['--account', 'example.1password.com', 'read', '--no-newline', ref],
+      }))
+    );
+    await writeFile(
+      command,
+      `#!${process.execPath}\nprocess.stderr.write('synthetic-secret');process.exit(1);`
+    );
+    await assert.rejects(resolveLoginCredentials(config), (error) => {
+      assert.ok(error instanceof PublicError);
+      assert.equal(error.code, 'CREDENTIALS_UNAVAILABLE');
+      assert.equal(error.cause, undefined);
+      assert.ok(!JSON.stringify(error).includes('synthetic-secret'));
+      return true;
+    });
+    await writeFile(command, `#!${process.execPath}\nprocess.exit(0);`);
+    await assert.rejects(resolveLoginCredentials(config), { code: 'CREDENTIALS_UNAVAILABLE' });
+    assert.deepEqual(
+      await resolveLoginCredentials(
+        loadConfig({
+          ...env,
+          MAGISTER_USER: 'plain-user',
+          MAGISTER_PASS: 'plain-password',
+        })
+      ),
+      { username: 'plain-user', password: 'plain-password' }
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 it('reads a fresh OTP with explicit account and without forwarding Magister credentials', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'magister-op-'));

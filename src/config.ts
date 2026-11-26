@@ -23,6 +23,8 @@ export interface Config {
   readonly sessionMaxAgeMs: number;
   readonly debug: boolean;
   readonly otp?: { reference: string; account?: string; command: string };
+  /** CLI settings for credentials resolved only when a login form is shown. */
+  readonly onePassword?: { account?: string; command: string };
 }
 
 export interface ConfigOptions {
@@ -193,6 +195,18 @@ export function loadConfig(
   const profile = env.MAGISTER_PROFILE || env.MAGISTER_USER || 'default';
   if (profile.length > 256) throw new PublicError('CONFIG_INVALID', 'MAGISTER_PROFILE');
 
+  let onePassword: Config['onePassword'];
+  if (username?.startsWith('op://') || password?.startsWith('op://')) {
+    const command = env.MAGISTER_1PASSWORD_COMMAND || 'op';
+    if (command !== 'op' && !isAbsolute(command)) {
+      throw new PublicError('CONFIG_INVALID', 'MAGISTER_1PASSWORD_COMMAND');
+    }
+    onePassword = {
+      command,
+      ...(env.MAGISTER_1PASSWORD_ACCOUNT ? { account: env.MAGISTER_1PASSWORD_ACCOUNT } : {}),
+    };
+  }
+
   let otp: Config['otp'];
   if (env.MAGISTER_1PASSWORD_OTP) {
     // No op:// prefix: `op run` must not resolve this to a stale code at startup.
@@ -242,5 +256,6 @@ export function loadConfig(
     sessionMaxAgeMs: sessionMaxAgeDays * DAY_MS,
     debug: env.MAGISTER_DEBUG === '1' || env.MAGISTER_DEBUG === 'true',
     ...(otp ? { otp } : {}),
+    ...(onePassword ? { onePassword } : {}),
   };
 }

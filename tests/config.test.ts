@@ -46,6 +46,34 @@ const extraHostileSchools = [
 ];
 
 const PACKAGE_ROOT = '/opt/pkg/unofficial-magister-mcp';
+describe('deferred 1Password credentials', () => {
+  const env = {
+    MAGISTER_SCHOOL: 'fixture-school',
+    MAGISTER_AUTH_MODE: 'password',
+    MAGISTER_PROFILE: 'existing-profile',
+    MAGISTER_USER: 'op://Private/Magister/username',
+    MAGISTER_PASS: 'op://Private/Magister/password',
+    MAGISTER_1PASSWORD_ACCOUNT: 'example.1password.com',
+    MAGISTER_1PASSWORD_COMMAND: '/nonexistent/op',
+  };
+  it('validates configuration without starting the CLI or changing the profile', () => {
+    const config = loadConfig(env);
+    assert.equal(config.username, env.MAGISTER_USER);
+    assert.equal(config.password, env.MAGISTER_PASS);
+    assert.equal(config.profile, 'existing-profile');
+    assert.deepEqual(config.onePassword, {
+      command: '/nonexistent/op',
+      account: 'example.1password.com',
+    });
+  });
+  it('rejects relative CLI paths even when MFA is not configured', () => {
+    expectConfigError(
+      () => loadConfig({ ...env, MAGISTER_1PASSWORD_COMMAND: './op' }),
+      'MAGISTER_1PASSWORD_COMMAND'
+    );
+  });
+});
+
 describe('1Password MFA configuration', () => {
   const env = {
     MAGISTER_SCHOOL: 'fixture-school',

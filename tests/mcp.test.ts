@@ -2,7 +2,9 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +19,46 @@ function requireBuild() {
 }
 
 describe('compiled server over stdio', { timeout: 60_000 }, () => {
+  it('initializes and lists tools in password mode without starting 1Password', async () => {
+    requireBuild();
+    const dir = await mkdtemp(join(tmpdir(), 'magister-no-startup-op-'));
+    const called = join(dir, 'op-called');
+    const command = join(dir, 'op');
+    await writeFile(
+      command,
+      `#!${process.execPath}
+require('node:fs').writeFileSync(${JSON.stringify(called)}, 'called');
+process.exit(1);
+`,
+      { mode: 0o700 }
+    );
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [ENTRY],
+      cwd: dir,
+      env: {
+        PATH: process.env.PATH ?? '',
+        MAGISTER_SCHOOL: 'smoke-test',
+        MAGISTER_PROFILE: 'existing-profile',
+        MAGISTER_STATE_DIR: join(dir, 'state'),
+        MAGISTER_AUTH_MODE: 'password',
+        MAGISTER_USER: 'op://Private/Magister/username',
+        MAGISTER_PASS: 'op://Private/Magister/password',
+        MAGISTER_1PASSWORD_COMMAND: command,
+      },
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'startup-test', version: '1' });
+    try {
+      await client.connect(transport);
+      assert.equal((await client.listTools()).tools.length, 6);
+      assert.equal(existsSync(called), false);
+    } finally {
+      await client.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('passes the protocol smoke script', () => {
     requireBuild();
     const result = spawnSync(process.execPath, [join(ROOT, 'scripts', 'smoke.mjs')], {

@@ -4,6 +4,7 @@ import { BrowserSession, ClientDeps } from './browser-session.js';
 import type { Config } from './config.js';
 import { PublicError, PublicErrorCode } from './errors.js';
 import { logEvent } from './logger.js';
+import { resolveLoginCredentials } from './one-password.js';
 import { AccountSchema, ChildrenSchema } from './magister-api.js';
 import { AUTH_ORIGIN } from './security.js';
 import type { StoredSession } from './storage.js';
@@ -279,8 +280,6 @@ export async function passwordLogin(
   session: BrowserSession,
   deps: ClientDeps
 ): Promise<AcquiredToken> {
-  const { username, password } = deps.config;
-  if (!username || !password) throw new PublicError('CONFIG_INVALID', 'MAGISTER_PASS');
   const page = session.page;
   logEvent('login_started', { mode: 'password' });
   const watcher = await startFlow(session);
@@ -303,6 +302,8 @@ export async function passwordLogin(
     await session.guard.race(sleep(POLL_MS));
   }
 
+  assertCredentialOrigin(session, page);
+  const { username, password } = await resolveLoginCredentials(deps.config);
   assertCredentialOrigin(session, page);
   await page.fill('#username', username, { timeout: deps.timeouts.stepMs });
   assertCredentialOrigin(session, page);
